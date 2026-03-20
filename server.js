@@ -85,7 +85,7 @@ app.use(express.json());
 
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(",") : "*",
-  methods: ["GET", "POST"],
+  methods: ["GET", "POST", "PATCH", "DELETE"],
   allowedHeaders: ["Authorization", "Content-Type"],
 }));
 
@@ -305,6 +305,82 @@ app.post("/media/upload", requireAuth, (req, res) => {
 });
 
 /**
+ * DELETE /media/file/:filename
+ * Protected — requires Bearer token
+ * Permanently deletes the file from disk.
+ */
+app.delete("/media/file/:filename", requireAuth, (req, res) => {
+  const safeName = path.basename(decodeURIComponent(req.params.filename));
+  const filePath = path.join(MEDIA_DIR, safeName);
+
+  if (!filePath.startsWith(path.resolve(MEDIA_DIR))) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "File not found" });
+  }
+
+  try {
+    fs.unlinkSync(filePath);
+    res.json({ message: "File deleted", filename: safeName });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete file", detail: err.message });
+  }
+});
+
+/**
+ * PATCH /media/file/:filename
+ * Protected — requires Bearer token
+ * Renames a file. Body: { "filename": "new-name.ext" }
+ * The extension must match the original (can't change file type).
+ */
+app.patch("/media/file/:filename", requireAuth, (req, res) => {
+  const safeName = path.basename(decodeURIComponent(req.params.filename));
+  const filePath = path.join(MEDIA_DIR, safeName);
+
+  if (!filePath.startsWith(path.resolve(MEDIA_DIR))) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "File not found" });
+  }
+
+  const { filename: newFilename } = req.body;
+  if (!newFilename) {
+    return res.status(400).json({ error: "New filename is required." });
+  }
+
+  const safeNewName = path.basename(newFilename).replace(/[^a-zA-Z0-9._-]/g, "_");
+  const newFilePath = path.join(MEDIA_DIR, safeNewName);
+
+  if (!newFilePath.startsWith(path.resolve(MEDIA_DIR))) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (path.extname(safeNewName).toLowerCase() !== path.extname(safeName).toLowerCase()) {
+    return res.status(400).json({ error: "Cannot change file extension." });
+  }
+
+  if (fs.existsSync(newFilePath)) {
+    return res.status(409).json({ error: "A file with that name already exists." });
+  }
+
+  try {
+    fs.renameSync(filePath, newFilePath);
+    res.json({
+      message: "File renamed",
+      filename: safeNewName,
+      type: getMediaType(safeNewName),
+      url: `/media/file/${encodeURIComponent(safeNewName)}`,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to rename file", detail: err.message });
+  }
+});
+
+/**
  * GET /media/:id
  * Protected — requires Bearer token
  */
@@ -353,6 +429,8 @@ app.listen(PORT, () => {
   console.log(`  GET  /media?type=photo        → list photos only 🔒`);
   console.log(`  GET  /media?type=video        → list videos only 🔒`);
   console.log(`  GET  /media/:id               → single file metadata 🔒`);
-  console.log(`  GET  /media/file/:filename    → stream a file 🔒`);
-  console.log(`  POST /media/upload            → upload a file 🔒\n`);
+  console.log(`  GET    /media/file/:filename  → stream a file 🔒`);
+  console.log(`  POST   /media/upload          → upload files 🔒`);
+  console.log(`  DELETE /media/file/:filename  → delete a file 🔒`);
+  console.log(`  PATCH  /media/file/:filename  → rename a file 🔒\n`);
 });
