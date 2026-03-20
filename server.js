@@ -273,30 +273,33 @@ app.get("/media/file/:filename", requireAuth, (req, res) => {
 /**
  * POST /media/upload
  * Protected — requires Bearer token
- * Body: multipart/form-data with field "file"
+ * Body: multipart/form-data, field name "files" (one or many)
  *
- * multer diskStorage writes the incoming bytes directly to disk in streaming
- * fashion — the full file is never held in RAM, so large uploads (4K videos,
- * multiple GBs) work fine on a Raspberry Pi 5.
+ * multer diskStorage writes each file directly to disk as it arrives —
+ * never buffered in RAM, so large files and batches work fine on a Pi 5.
  */
 app.post("/media/upload", requireAuth, (req, res) => {
-  upload.single("file")(req, res, (err) => {
+  upload.array("files")(req, res, (err) => {
     if (err instanceof multer.MulterError) {
       return res.status(400).json({ error: `Upload error: ${err.message}` });
     }
     if (err) {
       return res.status(400).json({ error: err.message });
     }
-    if (!req.file) {
-      return res.status(400).json({ error: "No file provided." });
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files provided." });
     }
 
+    const uploaded = req.files.map((f) => ({
+      filename: f.filename,
+      size: f.size,
+      type: getMediaType(f.filename),
+      url: `/media/file/${encodeURIComponent(f.filename)}`,
+    }));
+
     res.status(201).json({
-      message: "Upload successful",
-      filename: req.file.filename,
-      size: req.file.size,
-      type: getMediaType(req.file.filename),
-      url: `/media/file/${encodeURIComponent(req.file.filename)}`,
+      message: `${uploaded.length} file(s) uploaded successfully`,
+      uploaded,
     });
   });
 });
