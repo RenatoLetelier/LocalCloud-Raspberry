@@ -255,10 +255,13 @@ app.get("/media", requireAuth, (req, res) => {
 
 /**
  * GET /media/file/:filename
- * Protected — requires Bearer token
+ * Public — no auth required (Cloudflare CDN caches this route)
+ * Photos get a 1-year immutable cache (WebP filenames never change).
+ * Videos get a 1-day cache; Cloudflare only caches files ≤ 512 MB —
+ * larger videos are proxied directly from the Pi without edge caching.
  * Streams the file with Range request support (needed for video seeking)
  */
-app.get("/media/file/:filename", requireAuth, (req, res) => {
+app.get("/media/file/:filename", (req, res) => {
   const filename = decodeURIComponent(req.params.filename);
   const safeName = path.basename(filename);
   const filePath = path.join(MEDIA_DIR, safeName);
@@ -275,6 +278,17 @@ app.get("/media/file/:filename", requireAuth, (req, res) => {
   const stat = fs.statSync(filePath);
   const fileSize = stat.size;
   const mimeType = getMimeType(safeName);
+  const mediaType = getMediaType(safeName);
+
+  // Photos: 1-year immutable (WebP files are written once and never modified)
+  // Videos: 1-day cache; Cloudflare won't cache files > 512 MB but the
+  //         header still benefits browser-level caching for smaller videos
+  const cacheControl = mediaType === "photo"
+    ? "public, max-age=31536000, immutable"
+    : "public, max-age=86400";
+
+  res.setHeader("Cache-Control", cacheControl);
+
   const range = req.headers.range;
 
   if (range) {
