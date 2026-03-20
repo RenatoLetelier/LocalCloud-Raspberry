@@ -1,6 +1,7 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
@@ -85,7 +86,7 @@ app.use(express.json());
 
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(",") : "*",
-  methods: ["GET", "POST"],
+  methods: ["GET", "POST", "PATCH", "DELETE"],
   allowedHeaders: ["Authorization", "Content-Type"],
 }));
 
@@ -305,6 +306,82 @@ app.post("/media/upload", requireAuth, (req, res) => {
 });
 
 /**
+ * DELETE /media/file/:filename
+ * Protected — requires Bearer token
+ * Permanently deletes the file from disk.
+ */
+app.delete("/media/file/:filename", requireAuth, (req, res) => {
+  const safeName = path.basename(decodeURIComponent(req.params.filename));
+  const filePath = path.join(MEDIA_DIR, safeName);
+
+  if (!filePath.startsWith(path.resolve(MEDIA_DIR))) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "File not found" });
+  }
+
+  try {
+    fs.unlinkSync(filePath);
+    res.json({ message: "File deleted", filename: safeName });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete file", detail: err.message });
+  }
+});
+
+/**
+ * PATCH /media/file/:filename
+ * Protected — requires Bearer token
+ * Renames a file. Body: { "filename": "new-name.ext" }
+ * The extension must match the original (can't change file type).
+ */
+app.patch("/media/file/:filename", requireAuth, (req, res) => {
+  const safeName = path.basename(decodeURIComponent(req.params.filename));
+  const filePath = path.join(MEDIA_DIR, safeName);
+
+  if (!filePath.startsWith(path.resolve(MEDIA_DIR))) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "File not found" });
+  }
+
+  const { filename: newFilename } = req.body;
+  if (!newFilename) {
+    return res.status(400).json({ error: "New filename is required." });
+  }
+
+  const safeNewName = path.basename(newFilename).replace(/[^a-zA-Z0-9._-]/g, "_");
+  const newFilePath = path.join(MEDIA_DIR, safeNewName);
+
+  if (!newFilePath.startsWith(path.resolve(MEDIA_DIR))) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (path.extname(safeNewName).toLowerCase() !== path.extname(safeName).toLowerCase()) {
+    return res.status(400).json({ error: "Cannot change file extension." });
+  }
+
+  if (fs.existsSync(newFilePath)) {
+    return res.status(409).json({ error: "A file with that name already exists." });
+  }
+
+  try {
+    fs.renameSync(filePath, newFilePath);
+    res.json({
+      message: "File renamed",
+      filename: safeNewName,
+      type: getMediaType(safeNewName),
+      url: `/media/file/${encodeURIComponent(safeNewName)}`,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to rename file", detail: err.message });
+  }
+});
+
+/**
  * GET /media/:id
  * Protected — requires Bearer token
  */
@@ -338,6 +415,130 @@ app.get("/media/:id", requireAuth, (req, res) => {
   });
 });
 
+// ─── DEDUPLICATION ──────────────────────────────────────────────────────────
+
+// Hash cache is stored as a hidden JSON file inside MEDIA_DIR.
+// Structure: { "<filename>": { "hash": "<sha256>", "mtime": "<iso>", "size": <bytes> } }
+// A file is only re-hashed when its mtime or size has changed — so repeated
+// calls are fast even on a large library.
+const HASH_CACHE_PATH = path.join(MEDIA_DIR, ".media-hashes.json");
+
+function loadHashCache() {
+  try {
+    if (fs.existsSync(HASH_CACHE_PATH)) {
+      return JSON.parse(fs.readFileSync(HASH_CACHE_PATH, "utf8"));
+    }
+  } catch (_) {}
+  return {};
+}
+
+function saveHashCache(cache) {
+  try {
+    fs.writeFileSync(HASH_CACHE_PATH, JSON.stringify(cache));
+  } catch (_) {}
+}
+
+function hashFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = fs.createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => resolve(hash.digest("hex")));
+    stream.on("error", reject);
+  });
+}
+
+/**
+ * POST /media/deduplicate
+ * Protected — requires Bearer token
+ *
+ * Scans the media directory, hashes every file (using a cache so only
+ * new/changed files are re-hashed), and returns groups of duplicate files.
+ * Nothing is deleted — the caller decides which files to remove via DELETE.
+ *
+ * Response includes stats so the caller knows how much work was done:
+ *   scanned    — total media files checked
+ *   fromCache  — files whose hash was already cached (fast, no disk read)
+ *   rehashed   — files that had to be hashed (new or modified)
+ */
+app.post("/media/deduplicate", requireAuth, async (req, res) => {
+  let files;
+  try {
+    files = fs.readdirSync(MEDIA_DIR).filter((f) => getMediaType(f));
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to read media directory", detail: err.message });
+  }
+
+  const cache = loadHashCache();
+  let rehashed = 0;
+
+  // Hash sequentially to avoid saturating Pi 5 I/O with parallel reads
+  for (const filename of files) {
+    const filePath = path.join(MEDIA_DIR, filename);
+    let stat;
+    try {
+      stat = fs.statSync(filePath);
+    } catch (_) {
+      continue;
+    }
+
+    const mtime = stat.mtime.toISOString();
+    const size = stat.size;
+    const cached = cache[filename];
+
+    // Skip if mtime and size are unchanged — hash is still valid
+    if (cached && cached.mtime === mtime && cached.size === size) continue;
+
+    try {
+      cache[filename] = { hash: await hashFile(filePath), mtime, size };
+      rehashed++;
+    } catch (_) {
+      // Skip files that can't be read (e.g. still being written)
+    }
+  }
+
+  // Purge cache entries for files that no longer exist
+  const fileSet = new Set(files);
+  for (const key of Object.keys(cache)) {
+    if (!fileSet.has(key)) delete cache[key];
+  }
+
+  saveHashCache(cache);
+
+  // Group filenames by hash — only groups with 2+ files are duplicates
+  const byHash = {};
+  for (const filename of files) {
+    if (!cache[filename]) continue;
+    const { hash } = cache[filename];
+    if (!byHash[hash]) byHash[hash] = [];
+    byHash[hash].push(filename);
+  }
+
+  const duplicates = Object.entries(byHash)
+    .filter(([, names]) => names.length > 1)
+    .map(([hash, names]) => ({
+      hash,
+      files: names.map((filename) => {
+        const stat = fs.statSync(path.join(MEDIA_DIR, filename));
+        return {
+          filename,
+          type: getMediaType(filename),
+          size: stat.size,
+          mtime: stat.mtime.toISOString(),
+          url: `/media/file/${encodeURIComponent(filename)}`,
+        };
+      }),
+    }));
+
+  res.json({
+    scanned: files.length,
+    fromCache: files.length - rehashed,
+    rehashed,
+    duplicateGroups: duplicates.length,
+    duplicates,
+  });
+});
+
 // ─── 404 ────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 
@@ -353,6 +554,9 @@ app.listen(PORT, () => {
   console.log(`  GET  /media?type=photo        → list photos only 🔒`);
   console.log(`  GET  /media?type=video        → list videos only 🔒`);
   console.log(`  GET  /media/:id               → single file metadata 🔒`);
-  console.log(`  GET  /media/file/:filename    → stream a file 🔒`);
-  console.log(`  POST /media/upload            → upload a file 🔒\n`);
+  console.log(`  GET    /media/file/:filename  → stream a file 🔒`);
+  console.log(`  POST   /media/upload          → upload files 🔒`);
+  console.log(`  DELETE /media/file/:filename  → delete a file 🔒`);
+  console.log(`  PATCH  /media/file/:filename  → rename a file 🔒`);
+  console.log(`  POST   /media/deduplicate     → find duplicate files 🔒\n`);
 });
