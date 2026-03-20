@@ -4,6 +4,9 @@ const path = require("path");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
+const dotenv = require("dotenv");
+
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
