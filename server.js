@@ -89,9 +89,6 @@ app.use(cors({
   allowedHeaders: ["Authorization", "Content-Type"],
 }));
 
-// Serve the web UI from /public
-app.use(express.static(path.join(__dirname, "public")));
-
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
@@ -115,31 +112,6 @@ function requireAuth(req, res, next) {
   }
 
   const token = authHeader.split(" ")[1];
-
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch (err) {
-    if (err.name === "TokenExpiredError") {
-      return res.status(401).json({ error: "Token expired. Please log in again." });
-    }
-    return res.status(401).json({ error: "Invalid token." });
-  }
-}
-
-// Auth that also accepts ?token= query param.
-// Needed so <video> and <img> elements can embed the token in the src URL,
-// since HTML media elements cannot send custom headers.
-function requireAuthFlexible(req, res, next) {
-  const token =
-    req.query.token ||
-    (req.headers.authorization?.startsWith("Bearer ")
-      ? req.headers.authorization.split(" ")[1]
-      : null);
-
-  if (!token) {
-    return res.status(401).json({ error: "Missing or malformed Authorization." });
-  }
 
   try {
     req.user = jwt.verify(token, JWT_SECRET);
@@ -251,14 +223,10 @@ app.get("/media", requireAuth, (req, res) => {
 
 /**
  * GET /media/file/:filename
- * Protected — requires Bearer token OR ?token= query param
+ * Protected — requires Bearer token
  * Streams the file with Range request support (needed for video seeking)
- *
- * For large videos, the Range-based approach is the most efficient strategy
- * on low-power hardware: Node simply pipes raw bytes from disk to the network.
- * No transcoding, no buffering the whole file in RAM.
  */
-app.get("/media/file/:filename", requireAuthFlexible, (req, res) => {
+app.get("/media/file/:filename", requireAuth, (req, res) => {
   const filename = decodeURIComponent(req.params.filename);
   const safeName = path.basename(filename);
   const filePath = path.join(MEDIA_DIR, safeName);
@@ -305,30 +273,33 @@ app.get("/media/file/:filename", requireAuthFlexible, (req, res) => {
 /**
  * POST /media/upload
  * Protected — requires Bearer token
- * Body: multipart/form-data with field "file"
+ * Body: multipart/form-data, field name "files" (one or many)
  *
- * multer diskStorage writes the incoming bytes directly to disk in streaming
- * fashion — the full file is never held in RAM, so large uploads (4K videos,
- * multiple GBs) work fine on a Raspberry Pi 5.
+ * multer diskStorage writes each file directly to disk as it arrives —
+ * never buffered in RAM, so large files and batches work fine on a Pi 5.
  */
 app.post("/media/upload", requireAuth, (req, res) => {
-  upload.single("file")(req, res, (err) => {
+  upload.array("files")(req, res, (err) => {
     if (err instanceof multer.MulterError) {
       return res.status(400).json({ error: `Upload error: ${err.message}` });
     }
     if (err) {
       return res.status(400).json({ error: err.message });
     }
-    if (!req.file) {
-      return res.status(400).json({ error: "No file provided." });
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files provided." });
     }
 
+    const uploaded = req.files.map((f) => ({
+      filename: f.filename,
+      size: f.size,
+      type: getMediaType(f.filename),
+      url: `/media/file/${encodeURIComponent(f.filename)}`,
+    }));
+
     res.status(201).json({
-      message: "Upload successful",
-      filename: req.file.filename,
-      size: req.file.size,
-      type: getMediaType(req.file.filename),
-      url: `/media/file/${encodeURIComponent(req.file.filename)}`,
+      message: `${uploaded.length} file(s) uploaded successfully`,
+      uploaded,
     });
   });
 });
@@ -383,6 +354,5 @@ app.listen(PORT, () => {
   console.log(`  GET  /media?type=video        → list videos only 🔒`);
   console.log(`  GET  /media/:id               → single file metadata 🔒`);
   console.log(`  GET  /media/file/:filename    → stream a file 🔒`);
-  console.log(`  POST /media/upload            → upload a file 🔒`);
-  console.log(`\n  Web UI → http://localhost:${PORT}\n`);
+  console.log(`  POST /media/upload            → upload a file 🔒\n`);
 });
