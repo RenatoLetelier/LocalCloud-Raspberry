@@ -6,6 +6,7 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const multer = require("multer");
+const sharp = require("sharp");
 const dotenv = require("dotenv");
 
 dotenv.config();
@@ -33,6 +34,16 @@ if (!fs.existsSync(MEDIA_DIR)) {
 const IMAGE_EXTENSIONS = new Set([
   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg", ".heic", ".avif",
 ]);
+
+// These formats are converted to WebP on upload. Already-modern formats
+// (webp, avif, svg) and videos are left untouched.
+const CONVERTIBLE_TO_WEBP = new Set([
+  ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".heic", ".gif",
+]);
+
+// Quality 1-100. 85 is a great default — visually lossless for photos.
+// Lower it (e.g. 75) to save more storage at the cost of slight quality loss.
+const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY || "85", 10);
 const VIDEO_EXTENSIONS = new Set([
   ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v", ".3gp", ".ts",
 ]);
@@ -57,6 +68,26 @@ function getMimeType(filename) {
     ".3gp": "video/3gpp", ".ts": "video/mp2t",
   };
   return mimes[ext] || "application/octet-stream";
+}
+
+// ─── IMAGE CONVERSION ───────────────────────────────────────────────────────
+
+/**
+ * Converts an uploaded image to WebP and deletes the original.
+ * Returns the new file path, or null if the file doesn't need conversion.
+ * GIFs are handled with { animated: true } to preserve animation.
+ */
+async function convertToWebP(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (!CONVERTIBLE_TO_WEBP.has(ext)) return null;
+
+  const webpPath = filePath.slice(0, -ext.length) + ".webp";
+  await sharp(filePath, { animated: ext === ".gif" })
+    .webp({ quality: WEBP_QUALITY })
+    .toFile(webpPath);
+
+  fs.unlinkSync(filePath);
+  return webpPath;
 }
 
 // ─── UPLOAD CONFIG ─────────────────────────────────────────────────────────
@@ -278,9 +309,13 @@ app.get("/media/file/:filename", requireAuth, (req, res) => {
  *
  * multer diskStorage writes each file directly to disk as it arrives —
  * never buffered in RAM, so large files and batches work fine on a Pi 5.
+ *
+ * After saving, convertible images (JPEG, PNG, BMP, TIFF, HEIC, GIF) are
+ * converted to WebP at WEBP_QUALITY (default 85). Conversion is sequential
+ * to avoid saturating the Pi 5. Videos are stored as-is.
  */
 app.post("/media/upload", requireAuth, (req, res) => {
-  upload.array("files")(req, res, (err) => {
+  upload.array("files")(req, res, async (err) => {
     if (err instanceof multer.MulterError) {
       return res.status(400).json({ error: `Upload error: ${err.message}` });
     }
@@ -291,12 +326,36 @@ app.post("/media/upload", requireAuth, (req, res) => {
       return res.status(400).json({ error: "No files provided." });
     }
 
-    const uploaded = req.files.map((f) => ({
-      filename: f.filename,
-      size: f.size,
-      type: getMediaType(f.filename),
-      url: `/media/file/${encodeURIComponent(f.filename)}`,
-    }));
+    const uploaded = [];
+
+    // Process files one at a time — parallel Sharp workers would spike Pi 5 CPU
+    for (const f of req.files) {
+      let filename = f.filename;
+      let converted = false;
+      const originalSize = f.size;
+
+      try {
+        const webpPath = await convertToWebP(path.join(MEDIA_DIR, f.filename));
+        if (webpPath) {
+          filename = path.basename(webpPath);
+          converted = true;
+        }
+      } catch (convErr) {
+        // Conversion failed — keep the original file intact
+        console.error(`WebP conversion failed for ${f.filename}: ${convErr.message}`);
+      }
+
+      const finalStat = fs.statSync(path.join(MEDIA_DIR, filename));
+      uploaded.push({
+        filename,
+        originalFilename: f.originalname,
+        type: getMediaType(filename),
+        size: finalStat.size,
+        ...(converted && { originalSize, savedBytes: originalSize - finalStat.size }),
+        converted,
+        url: `/media/file/${encodeURIComponent(filename)}`,
+      });
+    }
 
     res.status(201).json({
       message: `${uploaded.length} file(s) uploaded successfully`,
@@ -547,6 +606,7 @@ app.listen(PORT, () => {
   console.log(`\n🚀 Media server running on port ${PORT}`);
   console.log(`📁 Serving files from: ${MEDIA_DIR}`);
   console.log(`🔒 Auth enabled — token expiry: ${TOKEN_EXPIRY}`);
+  console.log(`🖼️  WebP conversion enabled — quality: ${WEBP_QUALITY} (JPEG/PNG/BMP/TIFF/HEIC/GIF → WebP)`);
   console.log(`\nEndpoints:`);
   console.log(`  POST /auth/login              → get a JWT token`);
   console.log(`  GET  /health                  → health check (public)`);
