@@ -1,7 +1,11 @@
+"use strict";
+
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const os = require("os");
+const { execSync } = require("child_process");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
@@ -14,45 +18,53 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ─── CONFIG ────────────────────────────────────────────────────────────────
-const MEDIA_DIR = process.env.MEDIA_DIR || path.join(__dirname, "Media");
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
+
+const MEDIA_DIRS = [
+  process.env.MEDIA_DIR_1 || "/mnt/media1",
+  process.env.MEDIA_DIR_2 || "/mnt/media2",
+];
+
 const JWT_SECRET = process.env.JWT_SECRET;
 const API_PASSWORD = process.env.API_PASSWORD;
 const TOKEN_EXPIRY = process.env.TOKEN_EXPIRY || "24h";
+const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY || "85", 10);
 
 if (!JWT_SECRET || !API_PASSWORD) {
   console.error("❌  JWT_SECRET and API_PASSWORD must be set in your .env file.");
-  console.error("    Run: node generate-secret.js  to generate them.");
   process.exit(1);
 }
 
-// Ensure media directory exists
-if (!fs.existsSync(MEDIA_DIR)) {
-  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+// Ensure drives exist (creates dirs locally for dev if not mounted)
+for (const dir of MEDIA_DIRS) {
+  if (!fs.existsSync(dir)) {
+    console.warn(`⚠  Drive not found: ${dir} — creating for local dev`);
+    fs.mkdirSync(dir, { recursive: true });
+  }
 }
 
-const IMAGE_EXTENSIONS = new Set([
-  ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg", ".heic", ".avif",
+// ─── MEDIA TYPES ─────────────────────────────────────────────────────────────
+
+const PHOTO_EXTS = new Set([
+  ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
+  ".tiff", ".tif", ".heic", ".heif", ".avif",
 ]);
 
-// These formats are converted to WebP on upload. Already-modern formats
-// (webp, avif, svg) and videos are left untouched.
+// These formats are converted to WebP on upload.
+// Already-modern formats (.webp, .avif) and videos are stored as-is.
 const CONVERTIBLE_TO_WEBP = new Set([
-  ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".heic", ".gif",
+  ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".heic", ".heif", ".gif",
 ]);
 
-// Quality 1-100. 85 is a great default — visually lossless for photos.
-// Lower it (e.g. 75) to save more storage at the cost of slight quality loss.
-const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY || "85", 10);
-const VIDEO_EXTENSIONS = new Set([
-  ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v", ".3gp", ".ts",
+const VIDEO_EXTS = new Set([
+  ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv",
+  ".wmv", ".m4v", ".3gp", ".ts", ".mpeg", ".mpg",
 ]);
 
-// ─── HELPERS ───────────────────────────────────────────────────────────────
 function getMediaType(filename) {
   const ext = path.extname(filename).toLowerCase();
-  if (IMAGE_EXTENSIONS.has(ext)) return "photo";
-  if (VIDEO_EXTENSIONS.has(ext)) return "video";
+  if (PHOTO_EXTS.has(ext)) return "photo";
+  if (VIDEO_EXTS.has(ext)) return "video";
   return null;
 }
 
@@ -61,58 +73,143 @@ function getMimeType(filename) {
   const mimes = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-    ".tiff": "image/tiff", ".svg": "image/svg+xml", ".heic": "image/heic",
-    ".avif": "image/avif", ".mp4": "video/mp4", ".mkv": "video/x-matroska",
-    ".mov": "video/quicktime", ".avi": "video/x-msvideo", ".webm": "video/webm",
-    ".flv": "video/x-flv", ".wmv": "video/x-ms-wmv", ".m4v": "video/x-m4v",
-    ".3gp": "video/3gpp", ".ts": "video/mp2t",
+    ".tiff": "image/tiff", ".tif": "image/tiff", ".heic": "image/heic",
+    ".heif": "image/heif", ".avif": "image/avif",
+    ".mp4": "video/mp4", ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime", ".avi": "video/x-msvideo",
+    ".webm": "video/webm", ".flv": "video/x-flv", ".wmv": "video/x-ms-wmv",
+    ".m4v": "video/x-m4v", ".3gp": "video/3gpp", ".ts": "video/mp2t",
+    ".mpeg": "video/mpeg", ".mpg": "video/mpeg",
   };
   return mimes[ext] || "application/octet-stream";
 }
 
-// ─── IMAGE CONVERSION ───────────────────────────────────────────────────────
+// ─── FILE ID SYSTEM ──────────────────────────────────────────────────────────
+//
+// Files are stored on disk as: {16hexId}_{sanitized-name}.ext
+//
+// Examples:
+//   a1b2c3d4e5f6a7b8_vacation.webp
+//   f9e8d7c6b5a49382_summer_2024.mp4
+//
+// The ID never changes. Renaming only updates the name part after the "_".
+// No database is needed on this server — the ID is embedded in the filename.
 
-/**
- * Converts an uploaded image to WebP and deletes the original.
- * Returns the new file path, or null if the file doesn't need conversion.
- * GIFs are handled with { animated: true } to preserve animation.
- */
-async function convertToWebP(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  if (!CONVERTIBLE_TO_WEBP.has(ext)) return null;
+const ID_RE = /^([0-9a-f]{16})_(.+)$/i;
 
-  const webpPath = filePath.slice(0, -ext.length) + ".webp";
-  await sharp(filePath, { animated: ext === ".gif" })
-    .webp({ quality: WEBP_QUALITY })
-    .toFile(webpPath);
-
-  fs.unlinkSync(filePath);
-  return webpPath;
+function generateId() {
+  return crypto.randomBytes(8).toString("hex"); // 16 hex chars
 }
 
-// ─── UPLOAD CONFIG ─────────────────────────────────────────────────────────
-// Uses disk storage so large files stream directly to disk — no RAM buffering
-const uploadStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, MEDIA_DIR),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext)
+function sanitizeName(filename) {
+  return (
+    filename
       .replace(/[^a-zA-Z0-9._-]/g, "_")
-      .slice(0, 200);
-    cb(null, `${base}${ext}`);
-  },
-});
+      .replace(/_+/g, "_")
+      .replace(/^[._-]+/, "") || "file"
+  );
+}
 
-const upload = multer({
-  storage: uploadStorage,
-  fileFilter: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (IMAGE_EXTENSIONS.has(ext) || VIDEO_EXTENSIONS.has(ext)) return cb(null, true);
-    cb(new Error(`Unsupported file type: ${ext}`));
-  },
-});
+function parseStoredName(filename) {
+  const m = filename.match(ID_RE);
+  return m ? { id: m[1], name: m[2] } : null;
+}
 
-// ─── MIDDLEWARE ─────────────────────────────────────────────────────────────
+function buildStoredName(id, name) {
+  return `${id}_${name}`;
+}
+
+// Scan all drives for a file with the given ID. Returns { dir, filename, id, name } or null.
+function findById(id) {
+  for (const dir of MEDIA_DIRS) {
+    let entries;
+    try { entries = fs.readdirSync(dir); } catch (_) { continue; }
+    for (const f of entries) {
+      const parsed = parseStoredName(f);
+      if (parsed && parsed.id === id) return { dir, filename: f, ...parsed };
+    }
+  }
+  return null;
+}
+
+function buildMeta(dir, filename) {
+  const parsed = parseStoredName(filename);
+  if (!parsed) return null;
+  let stat;
+  try { stat = fs.statSync(path.join(dir, filename)); } catch (_) { return null; }
+  return {
+    id: parsed.id,
+    filename: parsed.name,
+    type: getMediaType(parsed.name),
+    size: stat.size,
+    mtime: stat.mtime.toISOString(),
+    drive: dir,
+    url: `/media/files/${parsed.id}/stream`,
+  };
+}
+
+// ─── DRIVE UTILS ─────────────────────────────────────────────────────────────
+
+function getDriveFreeBytes(drivePath) {
+  try {
+    const out = execSync(`df -B1 --output=avail "${drivePath}"`, {
+      stdio: ["pipe", "pipe", "ignore"],
+    }).toString();
+    return parseInt(out.split("\n")[1].trim(), 10) || 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+// Pick the drive with the most free space for new uploads
+function selectDrive() {
+  let best = MEDIA_DIRS[0];
+  let bestFree = -1;
+  for (const dir of MEDIA_DIRS) {
+    const free = getDriveFreeBytes(dir);
+    if (free > bestFree) { bestFree = free; best = dir; }
+  }
+  return best;
+}
+
+// Cross-device safe move: tries rename first, falls back to stream copy + delete.
+// This matters because multer writes to OS tmpdir which may be on a different
+// filesystem than /mnt/media1 or /mnt/media2.
+function moveFile(src, dest) {
+  return new Promise((resolve, reject) => {
+    fs.rename(src, dest, (err) => {
+      if (!err) return resolve();
+      if (err.code !== "EXDEV") return reject(err);
+      // Different filesystems — stream the bytes across, then delete source
+      const r = fs.createReadStream(src);
+      const w = fs.createWriteStream(dest);
+      r.on("error", reject);
+      w.on("error", reject);
+      w.on("finish", () => fs.unlink(src, (e) => (e ? reject(e) : resolve())));
+      r.pipe(w);
+    });
+  });
+}
+
+// ─── AUTH ────────────────────────────────────────────────────────────────────
+
+function requireAuth(req, res, next) {
+  const auth = req.headers["authorization"] || "";
+  if (!auth.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Missing or malformed Authorization header." });
+  }
+  try {
+    req.user = jwt.verify(auth.slice(7), JWT_SECRET);
+    next();
+  } catch (err) {
+    res.status(401).json({
+      error: err.name === "TokenExpiredError" ? "Token expired." : "Invalid token.",
+    });
+  }
+}
+
+// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
+
 app.use(express.json());
 
 app.use(cors({
@@ -126,7 +223,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ─── RATE LIMITER (brute-force protection on login) ─────────────────────────
+// Rate limiter — brute-force protection on the login endpoint only
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -135,36 +232,44 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// ─── AUTH MIDDLEWARE ────────────────────────────────────────────────────────
-function requireAuth(req, res, next) {
-  const authHeader = req.headers["authorization"];
+// Multer writes uploads to the OS tmpdir so large files stream straight to disk
+// without ever being buffered in RAM — safe for big 4K videos on the Pi 5.
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: os.tmpdir(),
+    filename: (_req, _file, cb) =>
+      cb(null, `media_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`),
+  }),
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (PHOTO_EXTS.has(ext) || VIDEO_EXTS.has(ext)) return cb(null, true);
+    cb(new Error(`Unsupported file type: ${ext}`));
+  },
+});
 
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Missing or malformed Authorization header." });
-  }
-
-  const token = authHeader.split(" ")[1];
-
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch (err) {
-    if (err.name === "TokenExpiredError") {
-      return res.status(401).json({ error: "Token expired. Please log in again." });
-    }
-    return res.status(401).json({ error: "Invalid token." });
-  }
-}
-
-// ─── ROUTES ─────────────────────────────────────────────────────────────────
+// ─── HEALTH ──────────────────────────────────────────────────────────────────
 
 /**
  * GET /health
- * Public — no auth required
+ * Public — returns drive accessibility and free space.
+ * Returns 503 if any drive is unreachable.
  */
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok" });
+  const drives = MEDIA_DIRS.map((dir) => {
+    let accessible = false;
+    let freeBytes = 0;
+    try {
+      fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK);
+      accessible = true;
+      freeBytes = getDriveFreeBytes(dir);
+    } catch (_) {}
+    return { path: dir, accessible, freeBytes };
+  });
+  const allOk = drives.every((d) => d.accessible);
+  res.status(allOk ? 200 : 503).json({ status: allOk ? "ok" : "degraded", drives });
 });
+
+// ─── AUTH ROUTES ─────────────────────────────────────────────────────────────
 
 /**
  * POST /auth/login
@@ -173,137 +278,111 @@ app.get("/health", (_req, res) => {
  */
 app.post("/auth/login", loginLimiter, (req, res) => {
   const { password } = req.body;
-
-  if (!password) {
-    return res.status(400).json({ error: "Password is required." });
-  }
-
-  if (password !== API_PASSWORD) {
-    return res.status(401).json({ error: "Invalid password." });
-  }
-
-  const token = jwt.sign(
-    { authorized: true },
-    JWT_SECRET,
-    { expiresIn: TOKEN_EXPIRY }
-  );
-
+  if (!password) return res.status(400).json({ error: "Password is required." });
+  if (password !== API_PASSWORD) return res.status(401).json({ error: "Invalid password." });
+  const token = jwt.sign({ authorized: true }, JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
   res.json({ token, expiresIn: TOKEN_EXPIRY });
 });
 
+// ─── LIST FILES ──────────────────────────────────────────────────────────────
+
 /**
- * GET /media
- * Protected — requires Bearer token
- * Query params:
- *   type=photo|video  → filter by type
- *   page=1            → page number (default 1)
- *   limit=50          → items per page (default 50, max 500)
+ * GET /media/files
+ * Protected
+ * Query:
+ *   type=photo|video  — filter by media type
+ *   sort=mtime|size|name  — sort field (default: mtime)
+ *   order=asc|desc  — sort direction (default: desc)
+ *   page=1, limit=50  — pagination (max 500 per page)
+ *
+ * Files from both drives are merged into a single sorted+paginated list.
  */
-app.get("/media", requireAuth, (req, res) => {
-  if (!fs.existsSync(MEDIA_DIR)) {
-    return res.status(500).json({ error: "Media directory not found", path: MEDIA_DIR });
+app.get("/media/files", requireAuth, (req, res) => {
+  const { type, sort = "mtime", order = "desc", page = "1", limit = "50" } = req.query;
+
+  let files = [];
+  for (const dir of MEDIA_DIRS) {
+    let entries;
+    try { entries = fs.readdirSync(dir); } catch (_) { continue; }
+    for (const f of entries) {
+      const meta = buildMeta(dir, f);
+      if (!meta) continue;
+      if (type && meta.type !== type) continue;
+      files.push(meta);
+    }
   }
 
-  let files;
-  try {
-    files = fs.readdirSync(MEDIA_DIR);
-  } catch (err) {
-    return res.status(500).json({ error: "Failed to read media directory", detail: err.message });
-  }
+  const sortFns = {
+    mtime: (a, b) => new Date(a.mtime) - new Date(b.mtime),
+    size:  (a, b) => a.size - b.size,
+    name:  (a, b) => a.filename.localeCompare(b.filename),
+  };
+  files.sort(sortFns[sort] || sortFns.mtime);
+  if (order === "desc") files.reverse();
 
-  let mediaFiles = files
-    .map((filename) => {
-      const type = getMediaType(filename);
-      if (!type) return null;
-
-      const fullPath = path.join(MEDIA_DIR, filename);
-      let size = null;
-      let mtime = null;
-      try {
-        const stat = fs.statSync(fullPath);
-        size = stat.size;
-        mtime = stat.mtime.toISOString();
-      } catch (_) {}
-
-      return {
-        id: path.parse(filename).name,
-        filename,
-        type,
-        size,
-        mtime,
-        url: `/media/file/${encodeURIComponent(filename)}`,
-      };
-    })
-    .filter(Boolean);
-
-  // Newest files first
-  mediaFiles.sort((a, b) => (b.mtime || "").localeCompare(a.mtime || ""));
-
-  const { type, page = "1", limit = "50" } = req.query;
-  if (type === "photo" || type === "video") {
-    mediaFiles = mediaFiles.filter((f) => f.type === type);
-  }
-
-  const pageNum = Math.max(1, parseInt(page));
-  const limitNum = Math.min(500, Math.max(1, parseInt(limit)));
-  const total = mediaFiles.length;
+  const pageNum = Math.max(1, parseInt(page, 10));
+  const limitNum = Math.min(500, Math.max(1, parseInt(limit, 10)));
+  const total = files.length;
   const totalPages = Math.ceil(total / limitNum) || 1;
-  const paginated = mediaFiles.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+  const data = files.slice((pageNum - 1) * limitNum, pageNum * limitNum);
 
-  res.json({ total, page: pageNum, totalPages, limit: limitNum, data: paginated });
+  res.json({ total, page: pageNum, totalPages, limit: limitNum, data });
 });
 
+// ─── GET ONE FILE METADATA ────────────────────────────────────────────────────
+
 /**
- * GET /media/file/:filename
- * Public — no auth required (Cloudflare CDN caches this route)
- * Photos get a 1-year immutable cache (WebP filenames never change).
- * Videos get a 1-day cache; Cloudflare only caches files ≤ 512 MB —
- * larger videos are proxied directly from the Pi without edge caching.
- * Streams the file with Range request support (needed for video seeking)
+ * GET /media/files/:id
+ * Protected — returns metadata only (no file content)
  */
-app.get("/media/file/:filename", (req, res) => {
-  const filename = decodeURIComponent(req.params.filename);
-  const safeName = path.basename(filename);
-  const filePath = path.join(MEDIA_DIR, safeName);
+app.get("/media/files/:id", requireAuth, (req, res) => {
+  const found = findById(req.params.id);
+  if (!found) return res.status(404).json({ error: "File not found" });
+  res.json(buildMeta(found.dir, found.filename));
+});
 
-  // Security: prevent path traversal
-  if (!filePath.startsWith(path.resolve(MEDIA_DIR))) {
-    return res.status(403).json({ error: "Forbidden" });
+// ─── STREAM ───────────────────────────────────────────────────────────────────
+
+/**
+ * GET /media/files/:id/stream
+ * Public — no auth required (Cloudflare CDN can cache this route)
+ *
+ * Supports Range requests for video seeking/scrubbing.
+ * Cache-Control:
+ *   Photos → public, max-age=31536000, immutable  (1 year — WebP never changes)
+ *   Videos → public, max-age=86400                (1 day — Cloudflare caches ≤512 MB)
+ */
+app.get("/media/files/:id/stream", (req, res) => {
+  const found = findById(req.params.id);
+  if (!found) return res.status(404).json({ error: "File not found" });
+
+  const filePath = path.join(found.dir, found.filename);
+  let stat;
+  try { stat = fs.statSync(filePath); } catch (_) {
+    return res.status(404).json({ error: "File not found on disk" });
   }
 
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: "File not found" });
-  }
-
-  const stat = fs.statSync(filePath);
   const fileSize = stat.size;
-  const mimeType = getMimeType(safeName);
-  const mediaType = getMediaType(safeName);
+  const mimeType = getMimeType(found.name);
 
-  // Photos: 1-year immutable (WebP files are written once and never modified)
-  // Videos: 1-day cache; Cloudflare won't cache files > 512 MB but the
-  //         header still benefits browser-level caching for smaller videos
-  const cacheControl = mediaType === "photo"
-    ? "public, max-age=31536000, immutable"
-    : "public, max-age=86400";
-
-  res.setHeader("Cache-Control", cacheControl);
+  res.setHeader(
+    "Cache-Control",
+    getMediaType(found.name) === "photo"
+      ? "public, max-age=31536000, immutable"
+      : "public, max-age=86400"
+  );
 
   const range = req.headers.range;
-
   if (range) {
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunkSize = end - start + 1;
-
+    const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(startStr, 10);
+    const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
     res.writeHead(206, {
       "Content-Range": `bytes ${start}-${end}/${fileSize}`,
       "Accept-Ranges": "bytes",
-      "Content-Length": chunkSize,
+      "Content-Length": end - start + 1,
       "Content-Type": mimeType,
     });
-
     fs.createReadStream(filePath, { start, end }).pipe(res);
   } else {
     res.writeHead(200, {
@@ -311,204 +390,171 @@ app.get("/media/file/:filename", (req, res) => {
       "Content-Type": mimeType,
       "Accept-Ranges": "bytes",
     });
-
     fs.createReadStream(filePath).pipe(res);
   }
 });
 
+// ─── UPLOAD ───────────────────────────────────────────────────────────────────
+
 /**
  * POST /media/upload
- * Protected — requires Bearer token
+ * Protected
  * Body: multipart/form-data, field name "files" (one or many)
  *
- * multer diskStorage writes each file directly to disk as it arrives —
- * never buffered in RAM, so large files and batches work fine on a Pi 5.
+ * Photo optimization (done at upload time on this server):
+ *   JPEG / PNG / BMP / TIFF / HEIC / GIF → WebP at WEBP_QUALITY (default 85)
+ *   Already WebP / AVIF → stored as-is (already optimized)
  *
- * After saving, convertible images (JPEG, PNG, BMP, TIFF, HEIC, GIF) are
- * converted to WebP at WEBP_QUALITY (default 85). Conversion is sequential
- * to avoid saturating the Pi 5. Videos are stored as-is.
+ * Video storage (no transcoding — too CPU-heavy for Pi 5):
+ *   Videos are stored as-is. For best results, encode to H.264 or H.265 MP4
+ *   before uploading. H.265 gives ~50% smaller files at the same quality.
+ *
+ * Drive selection: each file goes to the drive with the most free space.
+ *
+ * Files are stored as: {16hexId}_{sanitized-name}.ext
+ * The ID is returned in the response and is stable — use it for all future requests.
  */
 app.post("/media/upload", requireAuth, (req, res) => {
   upload.array("files")(req, res, async (err) => {
-    if (err instanceof multer.MulterError) {
-      return res.status(400).json({ error: `Upload error: ${err.message}` });
-    }
-    if (err) {
-      return res.status(400).json({ error: err.message });
-    }
+    if (err instanceof multer.MulterError) return res.status(400).json({ error: err.message });
+    if (err) return res.status(400).json({ error: err.message });
     if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ error: "No files provided." });
+      return res.status(400).json({ error: "No files provided. Use field name 'files'." });
     }
 
-    const uploaded = [];
+    const results = [];
 
     // Process files one at a time — parallel Sharp workers would spike Pi 5 CPU
-    for (const f of req.files) {
-      let filename = f.filename;
-      let converted = false;
-      const originalSize = f.size;
+    for (const file of req.files) {
+      const id = generateId();
+      const ext = path.extname(file.originalname).toLowerCase();
+      const targetDir = selectDrive();
 
       try {
-        const webpPath = await convertToWebP(path.join(MEDIA_DIR, f.filename));
-        if (webpPath) {
-          filename = path.basename(webpPath);
-          converted = true;
-        }
-      } catch (convErr) {
-        // Conversion failed — keep the original file intact
-        console.error(`WebP conversion failed for ${f.filename}: ${convErr.message}`);
-      }
+        if (CONVERTIBLE_TO_WEBP.has(ext)) {
+          // Convert to WebP — saves storage and reduces download size
+          const outName = buildStoredName(
+            id,
+            sanitizeName(path.basename(file.originalname, ext) + ".webp")
+          );
+          const outPath = path.join(targetDir, outName);
+          await sharp(file.path, { animated: ext === ".gif" })
+            .webp({ quality: WEBP_QUALITY })
+            .toFile(outPath);
+          fs.unlinkSync(file.path);
 
-      const finalStat = fs.statSync(path.join(MEDIA_DIR, filename));
-      uploaded.push({
-        filename,
-        originalFilename: f.originalname,
-        type: getMediaType(filename),
-        size: finalStat.size,
-        ...(converted && { originalSize, savedBytes: originalSize - finalStat.size }),
-        converted,
-        url: `/media/file/${encodeURIComponent(filename)}`,
-      });
+          const meta = buildMeta(targetDir, outName);
+          results.push({
+            ...meta,
+            originalName: file.originalname,
+            converted: true,
+            originalSize: file.size,
+            savedBytes: file.size - meta.size,
+          });
+        } else {
+          // Video or already-modern format — move to the selected drive as-is
+          const outName = buildStoredName(id, sanitizeName(file.originalname));
+          const outPath = path.join(targetDir, outName);
+          await moveFile(file.path, outPath);
+          results.push({
+            ...buildMeta(targetDir, outName),
+            originalName: file.originalname,
+            converted: false,
+          });
+        }
+      } catch (uploadErr) {
+        try { fs.unlinkSync(file.path); } catch (_) {}
+        results.push({ originalName: file.originalname, error: uploadErr.message });
+      }
     }
 
-    res.status(201).json({
-      message: `${uploaded.length} file(s) uploaded successfully`,
-      uploaded,
+    const status = results.some((r) => r.error) ? 207 : 201;
+    res.status(status).json({
+      uploaded: results.filter((r) => !r.error).length,
+      results,
     });
   });
 });
 
-/**
- * DELETE /media/file/:filename
- * Protected — requires Bearer token
- * Permanently deletes the file from disk.
- */
-app.delete("/media/file/:filename", requireAuth, (req, res) => {
-  const safeName = path.basename(decodeURIComponent(req.params.filename));
-  const filePath = path.join(MEDIA_DIR, safeName);
-
-  if (!filePath.startsWith(path.resolve(MEDIA_DIR))) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
-
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: "File not found" });
-  }
-
-  try {
-    fs.unlinkSync(filePath);
-    res.json({ message: "File deleted", filename: safeName });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to delete file", detail: err.message });
-  }
-});
+// ─── RENAME ───────────────────────────────────────────────────────────────────
 
 /**
- * PATCH /media/file/:filename
- * Protected — requires Bearer token
- * Renames a file. Body: { "filename": "new-name.ext" }
- * The extension must match the original (can't change file type).
+ * PATCH /media/files/:id
+ * Protected
+ * Body: { "filename": "new-name.ext" }
+ *
+ * Extension must match the original (can't change file type).
+ * The ID stays the same — only the name part of the stored filename changes.
  */
-app.patch("/media/file/:filename", requireAuth, (req, res) => {
-  const safeName = path.basename(decodeURIComponent(req.params.filename));
-  const filePath = path.join(MEDIA_DIR, safeName);
-
-  if (!filePath.startsWith(path.resolve(MEDIA_DIR))) {
-    return res.status(403).json({ error: "Forbidden" });
+app.patch("/media/files/:id", requireAuth, (req, res) => {
+  const { filename } = req.body;
+  if (!filename || typeof filename !== "string") {
+    return res.status(400).json({ error: "Body must include { filename: 'new-name.ext' }" });
   }
 
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ error: "File not found" });
+  const found = findById(req.params.id);
+  if (!found) return res.status(404).json({ error: "File not found" });
+
+  const currentExt = path.extname(found.name).toLowerCase();
+  const newExt = path.extname(filename).toLowerCase();
+  if (newExt && newExt !== currentExt) {
+    return res.status(400).json({
+      error: `Cannot change extension. Keep ${currentExt} or omit it.`,
+    });
   }
 
-  const { filename: newFilename } = req.body;
-  if (!newFilename) {
-    return res.status(400).json({ error: "New filename is required." });
-  }
+  const finalName = sanitizeName(newExt ? filename : filename + currentExt);
+  const newStoredName = buildStoredName(found.id, finalName);
+  const oldPath = path.join(found.dir, found.filename);
+  const newPath = path.join(found.dir, newStoredName);
 
-  const safeNewName = path.basename(newFilename).replace(/[^a-zA-Z0-9._-]/g, "_");
-  const newFilePath = path.join(MEDIA_DIR, safeNewName);
-
-  if (!newFilePath.startsWith(path.resolve(MEDIA_DIR))) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
-
-  if (path.extname(safeNewName).toLowerCase() !== path.extname(safeName).toLowerCase()) {
-    return res.status(400).json({ error: "Cannot change file extension." });
-  }
-
-  if (fs.existsSync(newFilePath)) {
+  if (fs.existsSync(newPath)) {
     return res.status(409).json({ error: "A file with that name already exists." });
   }
 
   try {
-    fs.renameSync(filePath, newFilePath);
-    res.json({
-      message: "File renamed",
-      filename: safeNewName,
-      type: getMediaType(safeNewName),
-      url: `/media/file/${encodeURIComponent(safeNewName)}`,
-    });
+    fs.renameSync(oldPath, newPath); // Same drive — always same filesystem
+    res.json(buildMeta(found.dir, newStoredName));
   } catch (err) {
-    res.status(500).json({ error: "Failed to rename file", detail: err.message });
+    res.status(500).json({ error: "Failed to rename", detail: err.message });
   }
 });
 
+// ─── DELETE ───────────────────────────────────────────────────────────────────
+
 /**
- * GET /media/:id
- * Protected — requires Bearer token
+ * DELETE /media/files/:id
+ * Protected — permanently deletes the file from disk.
  */
-app.get("/media/:id", requireAuth, (req, res) => {
-  const { id } = req.params;
+app.delete("/media/files/:id", requireAuth, (req, res) => {
+  const found = findById(req.params.id);
+  if (!found) return res.status(404).json({ error: "File not found" });
 
-  if (!fs.existsSync(MEDIA_DIR)) {
-    return res.status(500).json({ error: "Media directory not found" });
+  try {
+    fs.unlinkSync(path.join(found.dir, found.filename));
+    res.status(204).send();
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete", detail: err.message });
   }
-
-  const files = fs.readdirSync(MEDIA_DIR);
-  const match = files.find((f) => path.parse(f).name === id);
-
-  if (!match) {
-    return res.status(404).json({ error: "File not found" });
-  }
-
-  const type = getMediaType(match);
-  if (!type) {
-    return res.status(404).json({ error: "Not a supported media type" });
-  }
-
-  const stat = fs.statSync(path.join(MEDIA_DIR, match));
-
-  res.json({
-    id,
-    filename: match,
-    type,
-    size: stat.size,
-    url: `/media/file/${encodeURIComponent(match)}`,
-  });
 });
 
 // ─── DEDUPLICATION ──────────────────────────────────────────────────────────
 
-// Hash cache is stored as a hidden JSON file inside MEDIA_DIR.
-// Structure: { "<filename>": { "hash": "<sha256>", "mtime": "<iso>", "size": <bytes> } }
-// A file is only re-hashed when its mtime or size has changed — so repeated
-// calls are fast even on a large library.
-const HASH_CACHE_PATH = path.join(MEDIA_DIR, ".media-hashes.json");
+// Each drive has its own .media-hashes.json cache inside its root.
+// Files are only re-hashed when their mtime or size has changed.
+// Hashing is sequential (not parallel) to keep Pi 5 I/O load low.
+// The endpoint reports duplicates but deletes nothing — use DELETE to act.
 
-function loadHashCache() {
+function loadHashCache(dir) {
   try {
-    if (fs.existsSync(HASH_CACHE_PATH)) {
-      return JSON.parse(fs.readFileSync(HASH_CACHE_PATH, "utf8"));
-    }
+    const p = path.join(dir, ".media-hashes.json");
+    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, "utf8"));
   } catch (_) {}
   return {};
 }
 
-function saveHashCache(cache) {
-  try {
-    fs.writeFileSync(HASH_CACHE_PATH, JSON.stringify(cache));
-  } catch (_) {}
+function saveHashCache(dir, cache) {
+  try { fs.writeFileSync(path.join(dir, ".media-hashes.json"), JSON.stringify(cache)); } catch (_) {}
 }
 
 function hashFile(filePath) {
@@ -523,114 +569,94 @@ function hashFile(filePath) {
 
 /**
  * POST /media/deduplicate
- * Protected — requires Bearer token
+ * Protected
  *
- * Scans the media directory, hashes every file (using a cache so only
- * new/changed files are re-hashed), and returns groups of duplicate files.
- * Nothing is deleted — the caller decides which files to remove via DELETE.
- *
- * Response includes stats so the caller knows how much work was done:
- *   scanned    — total media files checked
- *   fromCache  — files whose hash was already cached (fast, no disk read)
- *   rehashed   — files that had to be hashed (new or modified)
+ * Scans both drives, groups files with identical SHA-256 hashes.
+ * Uses a per-drive cache so only new/changed files are re-hashed.
+ * Response stats:
+ *   scanned    — total media files checked across both drives
+ *   fromCache  — files whose hash was already cached (no disk read)
+ *   rehashed   — files that were newly hashed
  */
 app.post("/media/deduplicate", requireAuth, async (req, res) => {
-  let files;
-  try {
-    files = fs.readdirSync(MEDIA_DIR).filter((f) => getMediaType(f));
-  } catch (err) {
-    return res.status(500).json({ error: "Failed to read media directory", detail: err.message });
-  }
-
-  const cache = loadHashCache();
-  let rehashed = 0;
-
-  // Hash sequentially to avoid saturating Pi 5 I/O with parallel reads
-  for (const filename of files) {
-    const filePath = path.join(MEDIA_DIR, filename);
-    let stat;
-    try {
-      stat = fs.statSync(filePath);
-    } catch (_) {
-      continue;
-    }
-
-    const mtime = stat.mtime.toISOString();
-    const size = stat.size;
-    const cached = cache[filename];
-
-    // Skip if mtime and size are unchanged — hash is still valid
-    if (cached && cached.mtime === mtime && cached.size === size) continue;
-
-    try {
-      cache[filename] = { hash: await hashFile(filePath), mtime, size };
-      rehashed++;
-    } catch (_) {
-      // Skip files that can't be read (e.g. still being written)
-    }
-  }
-
-  // Purge cache entries for files that no longer exist
-  const fileSet = new Set(files);
-  for (const key of Object.keys(cache)) {
-    if (!fileSet.has(key)) delete cache[key];
-  }
-
-  saveHashCache(cache);
-
-  // Group filenames by hash — only groups with 2+ files are duplicates
+  let totalScanned = 0;
+  let totalRehashed = 0;
   const byHash = {};
-  for (const filename of files) {
-    if (!cache[filename]) continue;
-    const { hash } = cache[filename];
-    if (!byHash[hash]) byHash[hash] = [];
-    byHash[hash].push(filename);
+
+  for (const dir of MEDIA_DIRS) {
+    let entries;
+    try { entries = fs.readdirSync(dir).filter((f) => getMediaType(f)); } catch (_) { continue; }
+
+    const cache = loadHashCache(dir);
+    let rehashed = 0;
+
+    for (const filename of entries) {
+      const filePath = path.join(dir, filename);
+      let stat;
+      try { stat = fs.statSync(filePath); } catch (_) { continue; }
+
+      const mtime = stat.mtime.toISOString();
+      const size = stat.size;
+      const cached = cache[filename];
+
+      if (!cached || cached.mtime !== mtime || cached.size !== size) {
+        try {
+          cache[filename] = { hash: await hashFile(filePath), mtime, size };
+          rehashed++;
+        } catch (_) { continue; }
+      }
+
+      const { hash } = cache[filename];
+      if (!byHash[hash]) byHash[hash] = [];
+      byHash[hash].push({ dir, filename });
+    }
+
+    // Purge cache entries for files that no longer exist
+    const entrySet = new Set(entries);
+    for (const k of Object.keys(cache)) { if (!entrySet.has(k)) delete cache[k]; }
+    saveHashCache(dir, cache);
+
+    totalScanned += entries.length;
+    totalRehashed += rehashed;
   }
 
   const duplicates = Object.entries(byHash)
-    .filter(([, names]) => names.length > 1)
-    .map(([hash, names]) => ({
+    .filter(([, items]) => items.length > 1)
+    .map(([hash, items]) => ({
       hash,
-      files: names.map((filename) => {
-        const stat = fs.statSync(path.join(MEDIA_DIR, filename));
-        return {
-          filename,
-          type: getMediaType(filename),
-          size: stat.size,
-          mtime: stat.mtime.toISOString(),
-          url: `/media/file/${encodeURIComponent(filename)}`,
-        };
-      }),
+      files: items.map(({ dir, filename }) => buildMeta(dir, filename)).filter(Boolean),
     }));
 
   res.json({
-    scanned: files.length,
-    fromCache: files.length - rehashed,
-    rehashed,
+    scanned: totalScanned,
+    fromCache: totalScanned - totalRehashed,
+    rehashed: totalRehashed,
     duplicateGroups: duplicates.length,
     duplicates,
   });
 });
 
-// ─── 404 ────────────────────────────────────────────────────────────────────
+// ─── 404 ─────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 
-// ─── START ───────────────────────────────────────────────────────────────────
+// ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 Media server running on port ${PORT}`);
-  console.log(`📁 Serving files from: ${MEDIA_DIR}`);
   console.log(`🔒 Auth enabled — token expiry: ${TOKEN_EXPIRY}`);
-  console.log(`🖼️  WebP conversion enabled — quality: ${WEBP_QUALITY} (JPEG/PNG/BMP/TIFF/HEIC/GIF → WebP)`);
+  console.log(`🖼️  WebP quality: ${WEBP_QUALITY} (JPEG/PNG/BMP/TIFF/HEIC/GIF → WebP at upload)\n`);
+  console.log(`Drives:`);
+  for (const dir of MEDIA_DIRS) {
+    const freeGB = (getDriveFreeBytes(dir) / 1024 / 1024 / 1024).toFixed(1);
+    console.log(`  ${dir}  (${freeGB} GB free)`);
+  }
   console.log(`\nEndpoints:`);
-  console.log(`  POST /auth/login              → get a JWT token`);
-  console.log(`  GET  /health                  → health check (public)`);
-  console.log(`  GET  /media                   → list all media 🔒`);
-  console.log(`  GET  /media?type=photo        → list photos only 🔒`);
-  console.log(`  GET  /media?type=video        → list videos only 🔒`);
-  console.log(`  GET  /media/:id               → single file metadata 🔒`);
-  console.log(`  GET    /media/file/:filename  → stream a file 🔒`);
-  console.log(`  POST   /media/upload          → upload files 🔒`);
-  console.log(`  DELETE /media/file/:filename  → delete a file 🔒`);
-  console.log(`  PATCH  /media/file/:filename  → rename a file 🔒`);
-  console.log(`  POST   /media/deduplicate     → find duplicate files 🔒\n`);
+  console.log(`  POST   /auth/login               → get JWT token`);
+  console.log(`  GET    /health                   → drive status (public)`);
+  console.log(`  GET    /media/files              → list files 🔒`);
+  console.log(`  GET    /media/files/:id          → file metadata 🔒`);
+  console.log(`  GET    /media/files/:id/stream   → stream / download (public)`);
+  console.log(`  POST   /media/upload             → upload files 🔒`);
+  console.log(`  PATCH  /media/files/:id          → rename file 🔒`);
+  console.log(`  DELETE /media/files/:id          → delete file 🔒`);
+  console.log(`  POST   /media/deduplicate        → find duplicates 🔒\n`);
 });
