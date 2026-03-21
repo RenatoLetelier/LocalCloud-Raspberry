@@ -6,11 +6,13 @@ const path = require("path");
 const crypto = require("crypto");
 const os = require("os");
 const { execSync } = require("child_process");
+const { pipeline } = require("stream/promises");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const multer = require("multer");
 const sharp = require("sharp");
+const unzipper = require("unzipper");
 const dotenv = require("dotenv");
 
 dotenv.config();
@@ -35,11 +37,14 @@ if (!JWT_SECRET || !API_PASSWORD) {
   process.exit(1);
 }
 
-// Ensure drives exist (creates dirs locally for dev if not mounted)
+// Ensure photos/ and videos/ subdirectories exist on each drive
 for (const dir of MEDIA_DIRS) {
-  if (!fs.existsSync(dir)) {
-    console.warn(`⚠  Drive not found: ${dir} — creating for local dev`);
-    fs.mkdirSync(dir, { recursive: true });
+  for (const sub of ["photos", "videos"]) {
+    const full = path.join(dir, sub);
+    if (!fs.existsSync(full)) {
+      console.warn(`⚠  Creating ${full}`);
+      fs.mkdirSync(full, { recursive: true });
+    }
   }
 }
 
@@ -50,50 +55,46 @@ const PHOTO_EXTS = new Set([
   ".tiff", ".tif", ".heic", ".heif", ".avif",
 ]);
 
-// These formats are converted to WebP on upload.
-// Already-modern formats (.webp, .avif) and videos are stored as-is.
+// These photo formats are converted to WebP on upload.
+// Already-modern formats (.webp, .avif) are stored as-is.
 const CONVERTIBLE_TO_WEBP = new Set([
   ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".heic", ".heif", ".gif",
 ]);
 
-const VIDEO_EXTS = new Set([
-  ".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv",
-  ".wmv", ".m4v", ".3gp", ".ts", ".mpeg", ".mpg",
+// File types accepted when adding a single file to an existing video directory
+const VIDEO_FILE_EXTS = new Set([
+  ".m3u8", ".ts", ".vtt", ".srt", ".ac3", ".aac", ".mp3",
 ]);
-
-function getMediaType(filename) {
-  const ext = path.extname(filename).toLowerCase();
-  if (PHOTO_EXTS.has(ext)) return "photo";
-  if (VIDEO_EXTS.has(ext)) return "video";
-  return null;
-}
 
 function getMimeType(filename) {
   const ext = path.extname(filename).toLowerCase();
   const mimes = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-    ".tiff": "image/tiff", ".tif": "image/tiff", ".heic": "image/heic",
-    ".heif": "image/heif", ".avif": "image/avif",
-    ".mp4": "video/mp4", ".mkv": "video/x-matroska",
-    ".mov": "video/quicktime", ".avi": "video/x-msvideo",
-    ".webm": "video/webm", ".flv": "video/x-flv", ".wmv": "video/x-ms-wmv",
-    ".m4v": "video/x-m4v", ".3gp": "video/3gpp", ".ts": "video/mp2t",
-    ".mpeg": "video/mpeg", ".mpg": "video/mpeg",
+    ".tiff": "image/tiff", ".tif": "image/tiff",
+    ".heic": "image/heic", ".heif": "image/heif", ".avif": "image/avif",
+    ".m3u8": "application/vnd.apple.mpegurl",
+    ".ts":   "video/mp2t",
+    ".vtt":  "text/vtt",
+    ".srt":  "text/plain",
+    ".ac3":  "audio/ac3",
+    ".aac":  "audio/aac",
+    ".mp3":  "audio/mpeg",
   };
   return mimes[ext] || "application/octet-stream";
 }
 
 // ─── FILE ID SYSTEM ──────────────────────────────────────────────────────────
 //
-// Files are stored on disk as: {16hexId}_{sanitized-name}.ext
+// Storage layout:
+//   Photos:  {drive}/photos/{16hexId}_{sanitized-name}.webp
+//   Videos:  {drive}/videos/{16hexId}_{sanitized-name}/   ← directory
+//               ├── master.m3u8
+//               ├── 1080p/segment*.ts
+//               ├── audio_en.m3u8
+//               └── subtitles_en.vtt
 //
-// Examples:
-//   a1b2c3d4e5f6a7b8_vacation.webp
-//   f9e8d7c6b5a49382_summer_2024.mp4
-//
-// The ID never changes. Renaming only updates the name part after the "_".
-// No database is needed on this server — the ID is embedded in the filename.
+// The ID is permanent — rename only changes the name portion after the "_".
 
 const ID_RE = /^([0-9a-f]{16})_(.+)$/i;
 
@@ -101,17 +102,14 @@ function generateId() {
   return crypto.randomBytes(8).toString("hex"); // 16 hex chars
 }
 
-function sanitizeName(filename) {
+function sanitizeName(name) {
   return (
-    filename
-      .replace(/[^a-zA-Z0-9._-]/g, "_")
-      .replace(/_+/g, "_")
-      .replace(/^[._-]+/, "") || "file"
+    name.replace(/[^a-zA-Z0-9._-]/g, "_").replace(/_+/g, "_").replace(/^[._-]+/, "") || "file"
   );
 }
 
-function parseStoredName(filename) {
-  const m = filename.match(ID_RE);
+function parseStoredName(name) {
+  const m = name.match(ID_RE);
   return m ? { id: m[1], name: m[2] } : null;
 }
 
@@ -119,32 +117,88 @@ function buildStoredName(id, name) {
   return `${id}_${name}`;
 }
 
-// Scan all drives for a file with the given ID. Returns { dir, filename, id, name } or null.
-function findById(id) {
+// ─── PHOTO HELPERS ────────────────────────────────────────────────────────────
+
+function findPhotoById(id) {
   for (const dir of MEDIA_DIRS) {
     let entries;
-    try { entries = fs.readdirSync(dir); } catch (_) { continue; }
+    try { entries = fs.readdirSync(path.join(dir, "photos")); } catch (_) { continue; }
     for (const f of entries) {
       const parsed = parseStoredName(f);
-      if (parsed && parsed.id === id) return { dir, filename: f, ...parsed };
+      if (parsed && parsed.id === id) return { drive: dir, filename: f, ...parsed };
     }
   }
   return null;
 }
 
-function buildMeta(dir, filename) {
+function buildPhotoMeta(drive, filename) {
   const parsed = parseStoredName(filename);
   if (!parsed) return null;
   let stat;
-  try { stat = fs.statSync(path.join(dir, filename)); } catch (_) { return null; }
+  try { stat = fs.statSync(path.join(drive, "photos", filename)); } catch (_) { return null; }
   return {
     id: parsed.id,
     filename: parsed.name,
-    type: getMediaType(parsed.name),
+    type: "photo",
     size: stat.size,
     mtime: stat.mtime.toISOString(),
-    drive: dir,
+    drive,
     url: `/media/files/${parsed.id}/stream`,
+  };
+}
+
+// ─── VIDEO HELPERS ────────────────────────────────────────────────────────────
+
+function findVideoById(id) {
+  for (const dir of MEDIA_DIRS) {
+    let entries;
+    try { entries = fs.readdirSync(path.join(dir, "videos"), { withFileTypes: true }); } catch (_) { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const parsed = parseStoredName(entry.name);
+      if (parsed && parsed.id === id) return { drive: dir, dirname: entry.name, ...parsed };
+    }
+  }
+  return null;
+}
+
+function getDirSize(dirPath) {
+  let total = 0;
+  try {
+    for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+      const full = path.join(dirPath, entry.name);
+      total += entry.isDirectory() ? getDirSize(full) : (fs.statSync(full).size || 0);
+    }
+  } catch (_) {}
+  return total;
+}
+
+function buildVideoMeta(drive, dirname) {
+  const parsed = parseStoredName(dirname);
+  if (!parsed) return null;
+  const videoDir = path.join(drive, "videos", dirname);
+  let stat;
+  try { stat = fs.statSync(videoDir); } catch (_) { return null; }
+
+  const qualities = [], subtitles = [], audioTracks = [];
+  try {
+    for (const entry of fs.readdirSync(videoDir, { withFileTypes: true })) {
+      if (entry.isDirectory()) qualities.push(entry.name);
+      else if (entry.name.endsWith(".vtt") || entry.name.endsWith(".srt")) subtitles.push(entry.name);
+      else if (entry.name.startsWith("audio_") && entry.name.endsWith(".m3u8")) audioTracks.push(entry.name);
+    }
+  } catch (_) {}
+
+  return {
+    id: parsed.id,
+    name: parsed.name,
+    masterUrl: `/media/videos/${parsed.id}/stream/master.m3u8`,
+    size: getDirSize(videoDir),
+    mtime: stat.mtime.toISOString(),
+    drive,
+    qualities,
+    subtitles,
+    audioTracks,
   };
 }
 
@@ -161,10 +215,8 @@ function getDriveFreeBytes(drivePath) {
   }
 }
 
-// Pick the drive with the most free space for new uploads
 function selectDrive() {
-  let best = MEDIA_DIRS[0];
-  let bestFree = -1;
+  let best = MEDIA_DIRS[0], bestFree = -1;
   for (const dir of MEDIA_DIRS) {
     const free = getDriveFreeBytes(dir);
     if (free > bestFree) { bestFree = free; best = dir; }
@@ -173,14 +225,13 @@ function selectDrive() {
 }
 
 // Cross-device safe move: tries rename first, falls back to stream copy + delete.
-// This matters because multer writes to OS tmpdir which may be on a different
+// Important because multer writes to OS tmpdir which may be on a different
 // filesystem than /mnt/media1 or /mnt/media2.
 function moveFile(src, dest) {
   return new Promise((resolve, reject) => {
     fs.rename(src, dest, (err) => {
       if (!err) return resolve();
       if (err.code !== "EXDEV") return reject(err);
-      // Different filesystems — stream the bytes across, then delete source
       const r = fs.createReadStream(src);
       const w = fs.createWriteStream(dest);
       r.on("error", reject);
@@ -189,6 +240,37 @@ function moveFile(src, dest) {
       r.pipe(w);
     });
   });
+}
+
+// ─── ZIP EXTRACTION ──────────────────────────────────────────────────────────
+
+// Extracts a ZIP into targetDir with path traversal protection.
+// ZIP root must contain HLS files directly (master.m3u8 at root level).
+// Client should build the ZIP with: cd /hls-output && zip -0 -r movie.zip .
+async function extractZip(zipPath, targetDir) {
+  await fs.promises.mkdir(targetDir, { recursive: true });
+  const resolvedTarget = path.resolve(targetDir);
+  const directory = await unzipper.Open.file(zipPath);
+
+  for (const file of directory.files) {
+    const safePath = path.posix
+      .normalize(file.path.replace(/\\/g, "/"))
+      .replace(/^(\.\.(\/|$))+/, "");
+
+    if (!safePath || safePath === ".") continue;
+
+    const fullPath = path.join(targetDir, safePath);
+
+    // Security: reject entries that would escape the target directory
+    if (!path.resolve(fullPath).startsWith(resolvedTarget + path.sep)) continue;
+
+    if (file.type === "Directory") {
+      await fs.promises.mkdir(fullPath, { recursive: true });
+    } else {
+      await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+      await pipeline(file.stream(), fs.createWriteStream(fullPath));
+    }
+  }
 }
 
 // ─── AUTH ────────────────────────────────────────────────────────────────────
@@ -223,27 +305,49 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Rate limiter — brute-force protection on the login endpoint only
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
+  windowMs: 15 * 60 * 1000, max: 10,
   message: { error: "Too many login attempts. Try again in 15 minutes." },
-  standardHeaders: true,
-  legacyHeaders: false,
+  standardHeaders: true, legacyHeaders: false,
 });
 
-// Multer writes uploads to the OS tmpdir so large files stream straight to disk
-// without ever being buffered in RAM — safe for big 4K videos on the Pi 5.
-const upload = multer({
+// Photo upload: streams directly to disk, never buffered in RAM
+const photoUpload = multer({
   storage: multer.diskStorage({
     destination: os.tmpdir(),
     filename: (_req, _file, cb) =>
-      cb(null, `media_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`),
+      cb(null, `photo_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`),
   }),
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
-    if (PHOTO_EXTS.has(ext) || VIDEO_EXTS.has(ext)) return cb(null, true);
-    cb(new Error(`Unsupported file type: ${ext}`));
+    PHOTO_EXTS.has(ext) ? cb(null, true) : cb(new Error(`Unsupported photo format: ${ext}`));
+  },
+});
+
+// Video upload: accepts ZIP only
+const videoUpload = multer({
+  storage: multer.diskStorage({
+    destination: os.tmpdir(),
+    filename: (_req, _file, cb) =>
+      cb(null, `video_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.zip`),
+  }),
+  fileFilter: (_req, file, cb) => {
+    path.extname(file.originalname).toLowerCase() === ".zip"
+      ? cb(null, true)
+      : cb(new Error("Video uploads must be a .zip file containing the HLS structure."));
+  },
+});
+
+// Single-file upload for adding subtitles / audio tracks to an existing video
+const singleFileUpload = multer({
+  storage: multer.diskStorage({
+    destination: os.tmpdir(),
+    filename: (_req, _file, cb) =>
+      cb(null, `vfile_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`),
+  }),
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    VIDEO_FILE_EXTS.has(ext) ? cb(null, true) : cb(new Error(`Unsupported file type: ${ext}`));
   },
 });
 
@@ -251,13 +355,11 @@ const upload = multer({
 
 /**
  * GET /health
- * Public — returns drive accessibility and free space.
- * Returns 503 if any drive is unreachable.
+ * Public — drive accessibility and free bytes. Returns 503 if any drive is down.
  */
 app.get("/health", (_req, res) => {
   const drives = MEDIA_DIRS.map((dir) => {
-    let accessible = false;
-    let freeBytes = 0;
+    let accessible = false, freeBytes = 0;
     try {
       fs.accessSync(dir, fs.constants.R_OK | fs.constants.W_OK);
       accessible = true;
@@ -284,34 +386,24 @@ app.post("/auth/login", loginLimiter, (req, res) => {
   res.json({ token, expiresIn: TOKEN_EXPIRY });
 });
 
-// ─── LIST FILES ──────────────────────────────────────────────────────────────
+// ─── PHOTO ENDPOINTS ──────────────────────────────────────────────────────────
 
 /**
  * GET /media/files
  * Protected
- * Query:
- *   type=photo|video  — filter by media type
- *   sort=mtime|size|name  — sort field (default: mtime)
- *   order=asc|desc  — sort direction (default: desc)
- *   page=1, limit=50  — pagination (max 500 per page)
- *
- * Files from both drives are merged into a single sorted+paginated list.
+ * Query: sort=mtime|size|name, order=asc|desc, page=1, limit=50
  */
 app.get("/media/files", requireAuth, (req, res) => {
-  const { type, sort = "mtime", order = "desc", page = "1", limit = "50" } = req.query;
-
+  const { sort = "mtime", order = "desc", page = "1", limit = "50" } = req.query;
   let files = [];
   for (const dir of MEDIA_DIRS) {
     let entries;
-    try { entries = fs.readdirSync(dir); } catch (_) { continue; }
+    try { entries = fs.readdirSync(path.join(dir, "photos")); } catch (_) { continue; }
     for (const f of entries) {
-      const meta = buildMeta(dir, f);
-      if (!meta) continue;
-      if (type && meta.type !== type) continue;
-      files.push(meta);
+      const meta = buildPhotoMeta(dir, f);
+      if (meta) files.push(meta);
     }
   }
-
   const sortFns = {
     mtime: (a, b) => new Date(a.mtime) - new Date(b.mtime),
     size:  (a, b) => a.size - b.size,
@@ -319,103 +411,58 @@ app.get("/media/files", requireAuth, (req, res) => {
   };
   files.sort(sortFns[sort] || sortFns.mtime);
   if (order === "desc") files.reverse();
-
   const pageNum = Math.max(1, parseInt(page, 10));
   const limitNum = Math.min(500, Math.max(1, parseInt(limit, 10)));
   const total = files.length;
-  const totalPages = Math.ceil(total / limitNum) || 1;
-  const data = files.slice((pageNum - 1) * limitNum, pageNum * limitNum);
-
-  res.json({ total, page: pageNum, totalPages, limit: limitNum, data });
+  res.json({
+    total, page: pageNum,
+    totalPages: Math.ceil(total / limitNum) || 1,
+    limit: limitNum,
+    data: files.slice((pageNum - 1) * limitNum, pageNum * limitNum),
+  });
 });
-
-// ─── GET ONE FILE METADATA ────────────────────────────────────────────────────
 
 /**
  * GET /media/files/:id
- * Protected — returns metadata only (no file content)
+ * Protected — photo metadata
  */
 app.get("/media/files/:id", requireAuth, (req, res) => {
-  const found = findById(req.params.id);
-  if (!found) return res.status(404).json({ error: "File not found" });
-  res.json(buildMeta(found.dir, found.filename));
+  const found = findPhotoById(req.params.id);
+  if (!found) return res.status(404).json({ error: "Photo not found" });
+  res.json(buildPhotoMeta(found.drive, found.filename));
 });
-
-// ─── STREAM ───────────────────────────────────────────────────────────────────
 
 /**
  * GET /media/files/:id/stream
- * Public — no auth required (Cloudflare CDN can cache this route)
- *
- * Supports Range requests for video seeking/scrubbing.
- * Cache-Control:
- *   Photos → public, max-age=31536000, immutable  (1 year — WebP never changes)
- *   Videos → public, max-age=86400                (1 day — Cloudflare caches ≤512 MB)
+ * Public — serve a photo. 1-year immutable cache (WebP never changes).
  */
 app.get("/media/files/:id/stream", (req, res) => {
-  const found = findById(req.params.id);
-  if (!found) return res.status(404).json({ error: "File not found" });
-
-  const filePath = path.join(found.dir, found.filename);
+  const found = findPhotoById(req.params.id);
+  if (!found) return res.status(404).json({ error: "Photo not found" });
+  const filePath = path.join(found.drive, "photos", found.filename);
   let stat;
   try { stat = fs.statSync(filePath); } catch (_) {
     return res.status(404).json({ error: "File not found on disk" });
   }
-
-  const fileSize = stat.size;
-  const mimeType = getMimeType(found.name);
-
-  res.setHeader(
-    "Cache-Control",
-    getMediaType(found.name) === "photo"
-      ? "public, max-age=31536000, immutable"
-      : "public, max-age=86400"
-  );
-
-  const range = req.headers.range;
-  if (range) {
-    const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(startStr, 10);
-    const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
-    res.writeHead(206, {
-      "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-      "Accept-Ranges": "bytes",
-      "Content-Length": end - start + 1,
-      "Content-Type": mimeType,
-    });
-    fs.createReadStream(filePath, { start, end }).pipe(res);
-  } else {
-    res.writeHead(200, {
-      "Content-Length": fileSize,
-      "Content-Type": mimeType,
-      "Accept-Ranges": "bytes",
-    });
-    fs.createReadStream(filePath).pipe(res);
-  }
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  res.writeHead(200, {
+    "Content-Length": stat.size,
+    "Content-Type": getMimeType(found.name),
+  });
+  fs.createReadStream(filePath).pipe(res);
 });
-
-// ─── UPLOAD ───────────────────────────────────────────────────────────────────
 
 /**
  * POST /media/upload
  * Protected
- * Body: multipart/form-data, field name "files" (one or many)
+ * Body: multipart/form-data, field "files" (one or many)
  *
- * Photo optimization (done at upload time on this server):
- *   JPEG / PNG / BMP / TIFF / HEIC / GIF → WebP at WEBP_QUALITY (default 85)
- *   Already WebP / AVIF → stored as-is (already optimized)
- *
- * Video storage (no transcoding — too CPU-heavy for Pi 5):
- *   Videos are stored as-is. For best results, encode to H.264 or H.265 MP4
- *   before uploading. H.265 gives ~50% smaller files at the same quality.
- *
- * Drive selection: each file goes to the drive with the most free space.
- *
- * Files are stored as: {16hexId}_{sanitized-name}.ext
- * The ID is returned in the response and is stable — use it for all future requests.
+ * JPEG/PNG/BMP/TIFF/HEIC/GIF → converted to WebP at WEBP_QUALITY (default 85).
+ * Already WebP/AVIF → stored as-is.
+ * Uploads go to the drive with the most free space.
  */
 app.post("/media/upload", requireAuth, (req, res) => {
-  upload.array("files")(req, res, async (err) => {
+  photoUpload.array("files")(req, res, async (err) => {
     if (err instanceof multer.MulterError) return res.status(400).json({ error: err.message });
     if (err) return res.status(400).json({ error: err.message });
     if (!req.files || req.files.length === 0) {
@@ -423,43 +470,32 @@ app.post("/media/upload", requireAuth, (req, res) => {
     }
 
     const results = [];
-
-    // Process files one at a time — parallel Sharp workers would spike Pi 5 CPU
+    // Process one at a time — parallel Sharp workers would spike Pi 5 CPU
     for (const file of req.files) {
       const id = generateId();
       const ext = path.extname(file.originalname).toLowerCase();
-      const targetDir = selectDrive();
-
+      const targetDrive = selectDrive();
       try {
         if (CONVERTIBLE_TO_WEBP.has(ext)) {
-          // Convert to WebP — saves storage and reduces download size
           const outName = buildStoredName(
-            id,
-            sanitizeName(path.basename(file.originalname, ext) + ".webp")
+            id, sanitizeName(path.basename(file.originalname, ext) + ".webp")
           );
-          const outPath = path.join(targetDir, outName);
+          const outPath = path.join(targetDrive, "photos", outName);
           await sharp(file.path, { animated: ext === ".gif" })
             .webp({ quality: WEBP_QUALITY })
             .toFile(outPath);
           fs.unlinkSync(file.path);
-
-          const meta = buildMeta(targetDir, outName);
+          const meta = buildPhotoMeta(targetDrive, outName);
           results.push({
-            ...meta,
-            originalName: file.originalname,
-            converted: true,
-            originalSize: file.size,
-            savedBytes: file.size - meta.size,
+            ...meta, originalName: file.originalname,
+            converted: true, originalSize: file.size, savedBytes: file.size - meta.size,
           });
         } else {
-          // Video or already-modern format — move to the selected drive as-is
           const outName = buildStoredName(id, sanitizeName(file.originalname));
-          const outPath = path.join(targetDir, outName);
-          await moveFile(file.path, outPath);
+          await moveFile(file.path, path.join(targetDrive, "photos", outName));
           results.push({
-            ...buildMeta(targetDir, outName),
-            originalName: file.originalname,
-            converted: false,
+            ...buildPhotoMeta(targetDrive, outName),
+            originalName: file.originalname, converted: false,
           });
         }
       } catch (uploadErr) {
@@ -468,70 +504,281 @@ app.post("/media/upload", requireAuth, (req, res) => {
       }
     }
 
-    const status = results.some((r) => r.error) ? 207 : 201;
-    res.status(status).json({
+    res.status(results.some((r) => r.error) ? 207 : 201).json({
       uploaded: results.filter((r) => !r.error).length,
       results,
     });
   });
 });
 
-// ─── RENAME ───────────────────────────────────────────────────────────────────
-
 /**
  * PATCH /media/files/:id
- * Protected
+ * Protected — rename a photo
  * Body: { "filename": "new-name.ext" }
- *
- * Extension must match the original (can't change file type).
- * The ID stays the same — only the name part of the stored filename changes.
+ * Extension must match original.
  */
 app.patch("/media/files/:id", requireAuth, (req, res) => {
   const { filename } = req.body;
   if (!filename || typeof filename !== "string") {
     return res.status(400).json({ error: "Body must include { filename: 'new-name.ext' }" });
   }
-
-  const found = findById(req.params.id);
-  if (!found) return res.status(404).json({ error: "File not found" });
-
+  const found = findPhotoById(req.params.id);
+  if (!found) return res.status(404).json({ error: "Photo not found" });
   const currentExt = path.extname(found.name).toLowerCase();
   const newExt = path.extname(filename).toLowerCase();
   if (newExt && newExt !== currentExt) {
-    return res.status(400).json({
-      error: `Cannot change extension. Keep ${currentExt} or omit it.`,
-    });
+    return res.status(400).json({ error: `Cannot change extension. Keep ${currentExt} or omit it.` });
   }
-
   const finalName = sanitizeName(newExt ? filename : filename + currentExt);
   const newStoredName = buildStoredName(found.id, finalName);
-  const oldPath = path.join(found.dir, found.filename);
-  const newPath = path.join(found.dir, newStoredName);
-
-  if (fs.existsSync(newPath)) {
-    return res.status(409).json({ error: "A file with that name already exists." });
-  }
-
+  const oldPath = path.join(found.drive, "photos", found.filename);
+  const newPath = path.join(found.drive, "photos", newStoredName);
+  if (fs.existsSync(newPath)) return res.status(409).json({ error: "A file with that name already exists." });
   try {
-    fs.renameSync(oldPath, newPath); // Same drive — always same filesystem
-    res.json(buildMeta(found.dir, newStoredName));
+    fs.renameSync(oldPath, newPath);
+    res.json(buildPhotoMeta(found.drive, newStoredName));
   } catch (err) {
     res.status(500).json({ error: "Failed to rename", detail: err.message });
   }
 });
 
-// ─── DELETE ───────────────────────────────────────────────────────────────────
-
 /**
  * DELETE /media/files/:id
- * Protected — permanently deletes the file from disk.
+ * Protected — permanently delete a photo
  */
 app.delete("/media/files/:id", requireAuth, (req, res) => {
-  const found = findById(req.params.id);
-  if (!found) return res.status(404).json({ error: "File not found" });
-
+  const found = findPhotoById(req.params.id);
+  if (!found) return res.status(404).json({ error: "Photo not found" });
   try {
-    fs.unlinkSync(path.join(found.dir, found.filename));
+    fs.unlinkSync(path.join(found.drive, "photos", found.filename));
+    res.status(204).send();
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete", detail: err.message });
+  }
+});
+
+// ─── VIDEO ENDPOINTS ──────────────────────────────────────────────────────────
+
+/**
+ * GET /media/videos
+ * Protected
+ * Query: sort=mtime|size|name, order=asc|desc, page=1, limit=20
+ * Returns: id, name, masterUrl, size, mtime, drive, qualities, subtitles, audioTracks
+ */
+app.get("/media/videos", requireAuth, (req, res) => {
+  const { sort = "mtime", order = "desc", page = "1", limit = "20" } = req.query;
+  let videos = [];
+  for (const dir of MEDIA_DIRS) {
+    let entries;
+    try { entries = fs.readdirSync(path.join(dir, "videos"), { withFileTypes: true }); } catch (_) { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const meta = buildVideoMeta(dir, entry.name);
+      if (meta) videos.push(meta);
+    }
+  }
+  const sortFns = {
+    mtime: (a, b) => new Date(a.mtime) - new Date(b.mtime),
+    size:  (a, b) => a.size - b.size,
+    name:  (a, b) => a.name.localeCompare(b.name),
+  };
+  videos.sort(sortFns[sort] || sortFns.mtime);
+  if (order === "desc") videos.reverse();
+  const pageNum = Math.max(1, parseInt(page, 10));
+  const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10)));
+  const total = videos.length;
+  res.json({
+    total, page: pageNum,
+    totalPages: Math.ceil(total / limitNum) || 1,
+    limit: limitNum,
+    data: videos.slice((pageNum - 1) * limitNum, pageNum * limitNum),
+  });
+});
+
+/**
+ * GET /media/videos/:id
+ * Protected — video metadata
+ */
+app.get("/media/videos/:id", requireAuth, (req, res) => {
+  const found = findVideoById(req.params.id);
+  if (!found) return res.status(404).json({ error: "Video not found" });
+  res.json(buildVideoMeta(found.drive, found.dirname));
+});
+
+/**
+ * GET /media/videos/:id/stream/*
+ * Public — serve any HLS file inside the video directory.
+ *
+ * The HLS player (HLS.js, video.js, native) fetches all files automatically
+ * once given the masterUrl. Supports .m3u8 playlists, .ts segments,
+ * .vtt/.srt subtitles, and audio track files.
+ *
+ * Cache-Control:
+ *   .ts  → immutable 1 year  (segments are write-once, never modified)
+ *   rest → 5 minutes         (playlists/subtitles may be updated via /files)
+ */
+app.get("/media/videos/:id/stream/*", (req, res) => {
+  const found = findVideoById(req.params.id);
+  if (!found) return res.status(404).json({ error: "Video not found" });
+
+  const videoDir = path.join(found.drive, "videos", found.dirname);
+  const requestedFile = req.params[0]; // wildcard: everything after /stream/
+  const filePath = path.join(videoDir, requestedFile);
+
+  // Security: path traversal check
+  if (!path.resolve(filePath).startsWith(path.resolve(videoDir) + path.sep)) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
+
+  const ext = path.extname(filePath).toLowerCase();
+  const stat = fs.statSync(filePath);
+
+  res.setHeader("Cache-Control", ext === ".ts" ? "public, max-age=31536000, immutable" : "public, max-age=300");
+  res.setHeader("Content-Type", getMimeType(filePath));
+  res.setHeader("Content-Length", stat.size);
+  fs.createReadStream(filePath).pipe(res);
+});
+
+/**
+ * POST /media/videos/upload
+ * Protected
+ * Body: multipart/form-data
+ *   file (required) — ZIP containing the HLS structure at root level
+ *   name (optional) — display name; defaults to ZIP filename without .zip
+ *
+ * The ZIP root must contain master.m3u8 and quality subdirectories directly.
+ * Build the ZIP on the client with:
+ *   cd /path/to/ffmpeg-hls-output && zip -0 -r ~/movie.zip .
+ *
+ * Videos are NEVER transcoded on the Pi. Encode on your client with FFmpeg
+ * before uploading. Recommended codec: H.265 (HEVC) — ~50% smaller than H.264.
+ *
+ * Drive selection: the drive with the most free space receives the upload.
+ */
+app.post("/media/videos/upload", requireAuth, (req, res) => {
+  videoUpload.single("file")(req, res, async (err) => {
+    if (err instanceof multer.MulterError) return res.status(400).json({ error: err.message });
+    if (err) return res.status(400).json({ error: err.message });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file provided. Use field name 'file' with a .zip." });
+    }
+
+    const id = generateId();
+    const rawName = req.body.name || path.basename(req.file.originalname, ".zip");
+    const dirname = buildStoredName(id, sanitizeName(rawName));
+    const targetDrive = selectDrive();
+    const targetDir = path.join(targetDrive, "videos", dirname);
+
+    try {
+      await extractZip(req.file.path, targetDir);
+      fs.unlinkSync(req.file.path);
+
+      // Validate: a valid HLS upload must have master.m3u8 at root
+      if (!fs.existsSync(path.join(targetDir, "master.m3u8"))) {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+        return res.status(400).json({
+          error: "Invalid HLS structure: master.m3u8 not found at ZIP root.",
+          hint: "Build the ZIP from inside the HLS output directory: cd /hls-output && zip -0 -r movie.zip .",
+        });
+      }
+
+      res.status(201).json(buildVideoMeta(targetDrive, dirname));
+    } catch (uploadErr) {
+      try { fs.unlinkSync(req.file.path); } catch (_) {}
+      try { fs.rmSync(targetDir, { recursive: true, force: true }); } catch (_) {}
+      res.status(500).json({ error: "Upload failed", detail: uploadErr.message });
+    }
+  });
+});
+
+/**
+ * POST /media/videos/:id/files
+ * Protected
+ * Add or replace a single file inside an existing video directory.
+ * Use this to add subtitles or audio tracks without re-uploading the whole video.
+ *
+ * Body: multipart/form-data
+ *   file (required) — .vtt, .srt, .m3u8, .ts, .aac, .ac3, .mp3
+ *   path (optional) — relative path inside the video dir (default: file.originalname)
+ *                     Examples: "subtitles_fr.vtt"
+ *                               "audio_es.m3u8"
+ *
+ * If a file already exists at that path it is replaced.
+ */
+app.post("/media/videos/:id/files", requireAuth, (req, res) => {
+  singleFileUpload.single("file")(req, res, async (err) => {
+    if (err instanceof multer.MulterError) return res.status(400).json({ error: err.message });
+    if (err) return res.status(400).json({ error: err.message });
+    if (!req.file) return res.status(400).json({ error: "No file provided. Use field name 'file'." });
+
+    const found = findVideoById(req.params.id);
+    if (!found) {
+      try { fs.unlinkSync(req.file.path); } catch (_) {}
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    const videoDir = path.join(found.drive, "videos", found.dirname);
+    const rawRelPath = req.body.path || req.file.originalname;
+    const safeRelPath = path.normalize(rawRelPath.replace(/\\/g, "/"))
+      .replace(/^(\.\.(\/|$))+/, "");
+    const targetPath = path.join(videoDir, safeRelPath);
+
+    // Security: path traversal check
+    if (!path.resolve(targetPath).startsWith(path.resolve(videoDir) + path.sep)) {
+      try { fs.unlinkSync(req.file.path); } catch (_) {}
+      return res.status(403).json({ error: "Invalid path." });
+    }
+
+    try {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      await moveFile(req.file.path, targetPath);
+      res.status(201).json({
+        path: safeRelPath,
+        url: `/media/videos/${found.id}/stream/${safeRelPath}`,
+      });
+    } catch (uploadErr) {
+      try { fs.unlinkSync(req.file.path); } catch (_) {}
+      res.status(500).json({ error: "Failed to save file", detail: uploadErr.message });
+    }
+  });
+});
+
+/**
+ * PATCH /media/videos/:id
+ * Protected — rename a video
+ * Body: { "name": "new-name" }
+ * The ID stays the same — only the display name changes.
+ */
+app.patch("/media/videos/:id", requireAuth, (req, res) => {
+  const { name } = req.body;
+  if (!name || typeof name !== "string") {
+    return res.status(400).json({ error: "Body must include { name: 'new-name' }" });
+  }
+  const found = findVideoById(req.params.id);
+  if (!found) return res.status(404).json({ error: "Video not found" });
+  const newDirname = buildStoredName(found.id, sanitizeName(name));
+  const oldPath = path.join(found.drive, "videos", found.dirname);
+  const newPath = path.join(found.drive, "videos", newDirname);
+  if (fs.existsSync(newPath)) return res.status(409).json({ error: "A video with that name already exists." });
+  try {
+    fs.renameSync(oldPath, newPath);
+    res.json(buildVideoMeta(found.drive, newDirname));
+  } catch (err) {
+    res.status(500).json({ error: "Failed to rename", detail: err.message });
+  }
+});
+
+/**
+ * DELETE /media/videos/:id
+ * Protected — permanently deletes the entire video directory and all its segments.
+ */
+app.delete("/media/videos/:id", requireAuth, (req, res) => {
+  const found = findVideoById(req.params.id);
+  if (!found) return res.status(404).json({ error: "Video not found" });
+  try {
+    fs.rmSync(path.join(found.drive, "videos", found.dirname), { recursive: true, force: true });
     res.status(204).send();
   } catch (err) {
     res.status(500).json({ error: "Failed to delete", detail: err.message });
@@ -540,10 +787,8 @@ app.delete("/media/files/:id", requireAuth, (req, res) => {
 
 // ─── DEDUPLICATION ──────────────────────────────────────────────────────────
 
-// Each drive has its own .media-hashes.json cache inside its root.
-// Files are only re-hashed when their mtime or size has changed.
-// Hashing is sequential (not parallel) to keep Pi 5 I/O load low.
-// The endpoint reports duplicates but deletes nothing — use DELETE to act.
+// Applies to photos only. Video deduplication at segment level is not meaningful —
+// .ts segments differ slightly between encodings even for identical source material.
 
 function loadHashCache(dir) {
   try {
@@ -570,52 +815,42 @@ function hashFile(filePath) {
 /**
  * POST /media/deduplicate
  * Protected
- *
- * Scans both drives, groups files with identical SHA-256 hashes.
- * Uses a per-drive cache so only new/changed files are re-hashed.
- * Response stats:
- *   scanned    — total media files checked across both drives
- *   fromCache  — files whose hash was already cached (no disk read)
- *   rehashed   — files that were newly hashed
+ * Scans photos across both drives, groups files with identical SHA-256 hashes.
+ * Uses a per-drive cache — only new/changed files are re-hashed.
+ * Nothing is deleted; use DELETE /media/files/:id to act on results.
  */
 app.post("/media/deduplicate", requireAuth, async (req, res) => {
-  let totalScanned = 0;
-  let totalRehashed = 0;
+  let totalScanned = 0, totalRehashed = 0;
   const byHash = {};
 
   for (const dir of MEDIA_DIRS) {
     let entries;
-    try { entries = fs.readdirSync(dir).filter((f) => getMediaType(f)); } catch (_) { continue; }
+    try { entries = fs.readdirSync(path.join(dir, "photos")); } catch (_) { continue; }
 
     const cache = loadHashCache(dir);
     let rehashed = 0;
 
     for (const filename of entries) {
-      const filePath = path.join(dir, filename);
+      if (!parseStoredName(filename)) continue;
+      const filePath = path.join(dir, "photos", filename);
       let stat;
       try { stat = fs.statSync(filePath); } catch (_) { continue; }
 
-      const mtime = stat.mtime.toISOString();
-      const size = stat.size;
+      const mtime = stat.mtime.toISOString(), size = stat.size;
       const cached = cache[filename];
-
       if (!cached || cached.mtime !== mtime || cached.size !== size) {
-        try {
-          cache[filename] = { hash: await hashFile(filePath), mtime, size };
-          rehashed++;
-        } catch (_) { continue; }
+        try { cache[filename] = { hash: await hashFile(filePath), mtime, size }; rehashed++; }
+        catch (_) { continue; }
       }
 
       const { hash } = cache[filename];
       if (!byHash[hash]) byHash[hash] = [];
-      byHash[hash].push({ dir, filename });
+      byHash[hash].push({ drive: dir, filename });
     }
 
-    // Purge cache entries for files that no longer exist
     const entrySet = new Set(entries);
     for (const k of Object.keys(cache)) { if (!entrySet.has(k)) delete cache[k]; }
     saveHashCache(dir, cache);
-
     totalScanned += entries.length;
     totalRehashed += rehashed;
   }
@@ -624,7 +859,7 @@ app.post("/media/deduplicate", requireAuth, async (req, res) => {
     .filter(([, items]) => items.length > 1)
     .map(([hash, items]) => ({
       hash,
-      files: items.map(({ dir, filename }) => buildMeta(dir, filename)).filter(Boolean),
+      files: items.map(({ drive, filename }) => buildPhotoMeta(drive, filename)).filter(Boolean),
     }));
 
   res.json({
@@ -642,21 +877,30 @@ app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 // ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 Media server running on port ${PORT}`);
-  console.log(`🔒 Auth enabled — token expiry: ${TOKEN_EXPIRY}`);
-  console.log(`🖼️  WebP quality: ${WEBP_QUALITY} (JPEG/PNG/BMP/TIFF/HEIC/GIF → WebP at upload)\n`);
+  console.log(`🔒 Auth: JWT, expiry ${TOKEN_EXPIRY}`);
+  console.log(`🖼️  WebP quality: ${WEBP_QUALITY}\n`);
   console.log(`Drives:`);
   for (const dir of MEDIA_DIRS) {
     const freeGB = (getDriveFreeBytes(dir) / 1024 / 1024 / 1024).toFixed(1);
     console.log(`  ${dir}  (${freeGB} GB free)`);
   }
   console.log(`\nEndpoints:`);
-  console.log(`  POST   /auth/login               → get JWT token`);
-  console.log(`  GET    /health                   → drive status (public)`);
-  console.log(`  GET    /media/files              → list files 🔒`);
-  console.log(`  GET    /media/files/:id          → file metadata 🔒`);
-  console.log(`  GET    /media/files/:id/stream   → stream / download (public)`);
-  console.log(`  POST   /media/upload             → upload files 🔒`);
-  console.log(`  PATCH  /media/files/:id          → rename file 🔒`);
-  console.log(`  DELETE /media/files/:id          → delete file 🔒`);
-  console.log(`  POST   /media/deduplicate        → find duplicates 🔒\n`);
+  console.log(`  POST   /auth/login                    → get JWT`);
+  console.log(`  GET    /health                        → drive status (public)`);
+  console.log(`  ── Photos ──`);
+  console.log(`  GET    /media/files                   → list photos 🔒`);
+  console.log(`  GET    /media/files/:id               → photo metadata 🔒`);
+  console.log(`  GET    /media/files/:id/stream        → serve photo (public)`);
+  console.log(`  POST   /media/upload                  → upload photos 🔒`);
+  console.log(`  PATCH  /media/files/:id               → rename photo 🔒`);
+  console.log(`  DELETE /media/files/:id               → delete photo 🔒`);
+  console.log(`  POST   /media/deduplicate             → find duplicate photos 🔒`);
+  console.log(`  ── Videos ──`);
+  console.log(`  GET    /media/videos                  → list videos 🔒`);
+  console.log(`  GET    /media/videos/:id              → video metadata 🔒`);
+  console.log(`  GET    /media/videos/:id/stream/*     → serve HLS file (public)`);
+  console.log(`  POST   /media/videos/upload           → upload video ZIP 🔒`);
+  console.log(`  POST   /media/videos/:id/files        → add subtitle / audio track 🔒`);
+  console.log(`  PATCH  /media/videos/:id              → rename video 🔒`);
+  console.log(`  DELETE /media/videos/:id              → delete video 🔒\n`);
 });
