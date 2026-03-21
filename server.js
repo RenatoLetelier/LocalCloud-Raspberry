@@ -252,11 +252,18 @@ async function extractZip(zipPath, targetDir) {
   const resolvedTarget = path.resolve(targetDir);
   const directory = await unzipper.Open.file(zipPath);
 
-  for (const file of directory.files) {
-    const safePath = path.posix
-      .normalize(file.path.replace(/\\/g, "/"))
-      .replace(/^(\.\.(\/|$))+/, "");
+  // Detect if all entries share a single top-level wrapper folder (e.g. "videoplayback/")
+  // and strip it so files land directly in targetDir.
+  const topComponents = new Set(
+    directory.files.map((f) => f.path.replace(/\\/g, "/").split("/")[0])
+  );
+  const stripWrapper = topComponents.size === 1 && [...topComponents][0] !== "";
 
+  for (const file of directory.files) {
+    let rawPath = file.path.replace(/\\/g, "/");
+    if (stripWrapper) rawPath = rawPath.split("/").slice(1).join("/");
+
+    const safePath = path.posix.normalize(rawPath).replace(/^(\.\.(\/|$))+/, "");
     if (!safePath || safePath === ".") continue;
 
     const fullPath = path.join(targetDir, safePath);
