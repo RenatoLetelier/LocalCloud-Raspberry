@@ -30,7 +30,11 @@ const MEDIA_DIRS = [
 const JWT_SECRET = process.env.JWT_SECRET;
 const API_PASSWORD = process.env.API_PASSWORD;
 const TOKEN_EXPIRY = process.env.TOKEN_EXPIRY || "24h";
-const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY || "85", 10);
+const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY, 10) || 85;
+const MAX_PHOTO_BYTES = (parseInt(process.env.MAX_PHOTO_SIZE_MB, 10) || 50) * 1024 * 1024;
+const MAX_VIDEO_ZIP_BYTES = (parseInt(process.env.MAX_VIDEO_ZIP_GB, 10) || 50) * 1024 * 1024 * 1024;
+const MAX_VIDEO_FILE_BYTES = (parseInt(process.env.MAX_VIDEO_FILE_MB, 10) || 200) * 1024 * 1024;
+const MAX_BATCH_IDS = parseInt(process.env.MAX_BATCH_IDS, 10) || 100;
 
 if (!JWT_SECRET || !API_PASSWORD) {
   console.error("❌  JWT_SECRET and API_PASSWORD must be set in your .env file.");
@@ -173,7 +177,9 @@ function getDirSize(dirPath) {
   return total;
 }
 
-function buildVideoMeta(drive, dirname) {
+// includeSize=false skips the recursive directory walk — use it in listing endpoints.
+// Single-item endpoints (GET /media/videos/:id) use the default true.
+function buildVideoMeta(drive, dirname, { includeSize = true } = {}) {
   const parsed = parseStoredName(dirname);
   if (!parsed) return null;
   const videoDir = path.join(drive, "videos", dirname);
@@ -193,7 +199,7 @@ function buildVideoMeta(drive, dirname) {
     id: parsed.id,
     name: parsed.name,
     masterUrl: `/media/videos/${parsed.id}/stream/master.m3u8`,
-    size: getDirSize(videoDir),
+    size: includeSize ? getDirSize(videoDir) : null,
     mtime: stat.mtime.toISOString(),
     drive,
     qualities,
@@ -299,7 +305,7 @@ function requireAuth(req, res, next) {
 
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
 
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(",") : "*",
@@ -318,6 +324,14 @@ const loginLimiter = rateLimit({
   standardHeaders: true, legacyHeaders: false,
 });
 
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000, max: 300,
+  message: { error: "Too many requests. Please slow down." },
+  standardHeaders: true, legacyHeaders: false,
+});
+
+app.use(apiLimiter);
+
 // Photo upload: streams directly to disk, never buffered in RAM
 const photoUpload = multer({
   storage: multer.diskStorage({
@@ -325,6 +339,7 @@ const photoUpload = multer({
     filename: (_req, _file, cb) =>
       cb(null, `photo_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`),
   }),
+  limits: { fileSize: MAX_PHOTO_BYTES },
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     PHOTO_EXTS.has(ext) ? cb(null, true) : cb(new Error(`Unsupported photo format: ${ext}`));
@@ -338,6 +353,7 @@ const videoUpload = multer({
     filename: (_req, _file, cb) =>
       cb(null, `video_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.zip`),
   }),
+  limits: { fileSize: MAX_VIDEO_ZIP_BYTES },
   fileFilter: (_req, file, cb) => {
     path.extname(file.originalname).toLowerCase() === ".zip"
       ? cb(null, true)
@@ -352,6 +368,7 @@ const singleFileUpload = multer({
     filename: (_req, _file, cb) =>
       cb(null, `vfile_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`),
   }),
+  limits: { fileSize: MAX_VIDEO_FILE_BYTES },
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     VIDEO_FILE_EXTS.has(ext) ? cb(null, true) : cb(new Error(`Unsupported file type: ${ext}`));
@@ -399,9 +416,21 @@ app.post("/auth/login", loginLimiter, (req, res) => {
  * GET /media/files
  * Protected
  * Query: sort=mtime|size|name, order=asc|desc, page=1, limit=50
+ *        ids=a,b,c  — batch fetch by comma-separated IDs (skips sort/pagination)
  */
 app.get("/media/files", requireAuth, (req, res) => {
-  const { sort = "mtime", order = "desc", page = "1", limit = "50" } = req.query;
+  const { sort = "mtime", order = "desc", page = "1", limit = "50", ids } = req.query;
+
+  // Batch fetch — return only the requested IDs in the same order
+  if (ids) {
+    const idList = ids.split(",").map((s) => s.trim()).filter(Boolean).slice(0, MAX_BATCH_IDS);
+    const data = idList.map((id) => {
+      const found = findPhotoById(id);
+      return found ? buildPhotoMeta(found.drive, found.filename) : null;
+    }).filter(Boolean);
+    return res.json({ data });
+  }
+
   let files = [];
   for (const dir of MEDIA_DIRS) {
     let entries;
@@ -477,11 +506,11 @@ app.post("/media/upload", requireAuth, (req, res) => {
     }
 
     const results = [];
+    const targetDrive = selectDrive(); // select once — avoids calling df per file
     // Process one at a time — parallel Sharp workers would spike Pi 5 CPU
     for (const file of req.files) {
       const id = generateId();
       const ext = path.extname(file.originalname).toLowerCase();
-      const targetDrive = selectDrive();
       try {
         if (CONVERTIBLE_TO_WEBP.has(ext)) {
           const outName = buildStoredName(
@@ -570,17 +599,29 @@ app.delete("/media/files/:id", requireAuth, (req, res) => {
  * GET /media/videos
  * Protected
  * Query: sort=mtime|size|name, order=asc|desc, page=1, limit=20
+ *        ids=a,b,c  — batch fetch by comma-separated IDs (skips sort/pagination)
  * Returns: id, name, masterUrl, size, mtime, drive, qualities, subtitles, audioTracks
  */
 app.get("/media/videos", requireAuth, (req, res) => {
-  const { sort = "mtime", order = "desc", page = "1", limit = "20" } = req.query;
+  const { sort = "mtime", order = "desc", page = "1", limit = "20", ids } = req.query;
+
+  // Batch fetch — return only the requested IDs in the same order
+  if (ids) {
+    const idList = ids.split(",").map((s) => s.trim()).filter(Boolean).slice(0, MAX_BATCH_IDS);
+    const data = idList.map((id) => {
+      const found = findVideoById(id);
+      return found ? buildVideoMeta(found.drive, found.dirname) : null;
+    }).filter(Boolean);
+    return res.json({ data });
+  }
+
   let videos = [];
   for (const dir of MEDIA_DIRS) {
     let entries;
     try { entries = fs.readdirSync(path.join(dir, "videos"), { withFileTypes: true }); } catch (_) { continue; }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      const meta = buildVideoMeta(dir, entry.name);
+      const meta = buildVideoMeta(dir, entry.name, { includeSize: false });
       if (meta) videos.push(meta);
     }
   }
@@ -819,6 +860,8 @@ function hashFile(filePath) {
   });
 }
 
+let deduplicateInProgress = false;
+
 /**
  * POST /media/deduplicate
  * Protected
@@ -827,55 +870,66 @@ function hashFile(filePath) {
  * Nothing is deleted; use DELETE /media/files/:id to act on results.
  */
 app.post("/media/deduplicate", requireAuth, async (req, res) => {
-  let totalScanned = 0, totalRehashed = 0;
-  const byHash = {};
+  if (deduplicateInProgress) {
+    return res.status(409).json({ error: "Deduplication already in progress." });
+  }
+  deduplicateInProgress = true;
 
-  for (const dir of MEDIA_DIRS) {
-    let entries;
-    try { entries = fs.readdirSync(path.join(dir, "photos")); } catch (_) { continue; }
+  try {
+    let totalScanned = 0, totalRehashed = 0;
+    const byHash = {};
 
-    const cache = loadHashCache(dir);
-    let rehashed = 0;
+    for (const dir of MEDIA_DIRS) {
+      let entries;
+      try { entries = fs.readdirSync(path.join(dir, "photos")); } catch (_) { continue; }
 
-    for (const filename of entries) {
-      if (!parseStoredName(filename)) continue;
-      const filePath = path.join(dir, "photos", filename);
-      let stat;
-      try { stat = fs.statSync(filePath); } catch (_) { continue; }
+      const cache = loadHashCache(dir);
+      let rehashed = 0;
 
-      const mtime = stat.mtime.toISOString(), size = stat.size;
-      const cached = cache[filename];
-      if (!cached || cached.mtime !== mtime || cached.size !== size) {
-        try { cache[filename] = { hash: await hashFile(filePath), mtime, size }; rehashed++; }
-        catch (_) { continue; }
+      for (const filename of entries) {
+        if (!parseStoredName(filename)) continue;
+        const filePath = path.join(dir, "photos", filename);
+        let stat;
+        try { stat = fs.statSync(filePath); } catch (_) { continue; }
+
+        const mtime = stat.mtime.toISOString(), size = stat.size;
+        const cached = cache[filename];
+        if (!cached || cached.mtime !== mtime || cached.size !== size) {
+          try { cache[filename] = { hash: await hashFile(filePath), mtime, size }; rehashed++; }
+          catch (_) { continue; }
+        }
+
+        const { hash } = cache[filename];
+        if (!byHash[hash]) byHash[hash] = [];
+        byHash[hash].push({ drive: dir, filename });
       }
 
-      const { hash } = cache[filename];
-      if (!byHash[hash]) byHash[hash] = [];
-      byHash[hash].push({ drive: dir, filename });
+      const entrySet = new Set(entries);
+      for (const k of Object.keys(cache)) { if (!entrySet.has(k)) delete cache[k]; }
+      saveHashCache(dir, cache);
+      totalScanned += entries.length;
+      totalRehashed += rehashed;
     }
 
-    const entrySet = new Set(entries);
-    for (const k of Object.keys(cache)) { if (!entrySet.has(k)) delete cache[k]; }
-    saveHashCache(dir, cache);
-    totalScanned += entries.length;
-    totalRehashed += rehashed;
+    const duplicates = Object.entries(byHash)
+      .filter(([, items]) => items.length > 1)
+      .map(([hash, items]) => ({
+        hash,
+        files: items.map(({ drive, filename }) => buildPhotoMeta(drive, filename)).filter(Boolean),
+      }));
+
+    res.json({
+      scanned: totalScanned,
+      fromCache: totalScanned - totalRehashed,
+      rehashed: totalRehashed,
+      duplicateGroups: duplicates.length,
+      duplicates,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Deduplication failed", detail: err.message });
+  } finally {
+    deduplicateInProgress = false;
   }
-
-  const duplicates = Object.entries(byHash)
-    .filter(([, items]) => items.length > 1)
-    .map(([hash, items]) => ({
-      hash,
-      files: items.map(({ drive, filename }) => buildPhotoMeta(drive, filename)).filter(Boolean),
-    }));
-
-  res.json({
-    scanned: totalScanned,
-    fromCache: totalScanned - totalRehashed,
-    rehashed: totalRehashed,
-    duplicateGroups: duplicates.length,
-    duplicates,
-  });
 });
 
 // ─── 404 ─────────────────────────────────────────────────────────────────────
@@ -896,6 +950,7 @@ app.listen(PORT, () => {
   console.log(`  GET    /health                        → drive status (public)`);
   console.log(`  ── Photos ──`);
   console.log(`  GET    /media/files                   → list photos 🔒`);
+  console.log(`  GET    /media/files?ids=a,b,c         → batch fetch photos 🔒`);
   console.log(`  GET    /media/files/:id               → photo metadata 🔒`);
   console.log(`  GET    /media/files/:id/stream        → serve photo (public)`);
   console.log(`  POST   /media/upload                  → upload photos 🔒`);
@@ -904,6 +959,7 @@ app.listen(PORT, () => {
   console.log(`  POST   /media/deduplicate             → find duplicate photos 🔒`);
   console.log(`  ── Videos ──`);
   console.log(`  GET    /media/videos                  → list videos 🔒`);
+  console.log(`  GET    /media/videos?ids=a,b,c        → batch fetch videos 🔒`);
   console.log(`  GET    /media/videos/:id              → video metadata 🔒`);
   console.log(`  GET    /media/videos/:id/stream/*     → serve HLS file (public)`);
   console.log(`  POST   /media/videos/upload           → upload video ZIP 🔒`);
