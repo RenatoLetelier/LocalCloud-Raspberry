@@ -31,6 +31,8 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const API_PASSWORD = process.env.API_PASSWORD;
 const TOKEN_EXPIRY = process.env.TOKEN_EXPIRY || "24h";
 const WEBP_QUALITY = parseInt(process.env.WEBP_QUALITY, 10) || 85;
+const THUMB_SIZE = parseInt(process.env.THUMB_SIZE, 10) || 400;
+const THUMB_QUALITY = parseInt(process.env.THUMB_QUALITY, 10) || 75;
 const MAX_PHOTO_BYTES = (parseInt(process.env.MAX_PHOTO_SIZE_MB, 10) || 50) * 1024 * 1024;
 const MAX_VIDEO_ZIP_BYTES = (parseInt(process.env.MAX_VIDEO_ZIP_GB, 10) || 50) * 1024 * 1024 * 1024;
 const MAX_VIDEO_FILE_BYTES = (parseInt(process.env.MAX_VIDEO_FILE_MB, 10) || 200) * 1024 * 1024;
@@ -41,9 +43,9 @@ if (!JWT_SECRET || !API_PASSWORD) {
   process.exit(1);
 }
 
-// Ensure photos/ and videos/ subdirectories exist on each drive
+// Ensure photos/, videos/, and thumbs/ subdirectories exist on each drive
 for (const dir of MEDIA_DIRS) {
-  for (const sub of ["photos", "videos"]) {
+  for (const sub of ["photos", "videos", "thumbs"]) {
     const full = path.join(dir, sub);
     if (!fs.existsSync(full)) {
       console.warn(`⚠  Creating ${full}`);
@@ -148,6 +150,7 @@ function buildPhotoMeta(drive, filename) {
     mtime: stat.mtime.toISOString(),
     drive,
     url: `/media/files/${parsed.id}/stream`,
+    thumbnailUrl: `/media/files/${parsed.id}/thumbnail`,
   };
 }
 
@@ -199,6 +202,7 @@ function buildVideoMeta(drive, dirname, { includeSize = true } = {}) {
     id: parsed.id,
     name: parsed.name,
     masterUrl: `/media/videos/${parsed.id}/stream/master.m3u8`,
+    thumbnailUrl: `/media/videos/${parsed.id}/thumbnail`,
     size: includeSize ? getDirSize(videoDir) : null,
     mtime: stat.mtime.toISOString(),
     drive,
@@ -246,6 +250,47 @@ function moveFile(src, dest) {
       r.pipe(w);
     });
   });
+}
+
+// ─── THUMBNAIL HELPERS ────────────────────────────────────────────────────────
+
+function findThumbPath(id) {
+  for (const dir of MEDIA_DIRS) {
+    const p = path.join(dir, "thumbs", `${id}.webp`);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+async function generatePhotoThumb(photoPath, thumbPath) {
+  await sharp(photoPath)
+    .resize(THUMB_SIZE, THUMB_SIZE, { fit: "cover" })
+    .webp({ quality: THUMB_QUALITY })
+    .toFile(thumbPath);
+}
+
+// Extracts a frame from the first .ts segment found in any quality subdirectory.
+// Returns true on success, false if ffmpeg is unavailable or no segments exist.
+async function generateVideoThumb(videoDir, thumbPath) {
+  let tsFile = null;
+  try {
+    const entries = fs.readdirSync(videoDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      const subDir = path.join(videoDir, entry.name);
+      const segments = fs.readdirSync(subDir).filter((f) => f.endsWith(".ts")).sort();
+      if (segments.length > 0) { tsFile = path.join(subDir, segments[0]); break; }
+    }
+  } catch (_) {}
+  if (!tsFile) return false;
+  try {
+    execSync(
+      `ffmpeg -i "${tsFile}" -vframes 1 -vf "scale=${THUMB_SIZE}:-2" -y "${thumbPath}"`,
+      { stdio: "pipe", timeout: 30000 }
+    );
+    return fs.existsSync(thumbPath);
+  } catch (_) { return false; }
 }
 
 // ─── ZIP EXTRACTION ──────────────────────────────────────────────────────────
@@ -489,6 +534,24 @@ app.get("/media/files/:id/stream", (req, res) => {
 });
 
 /**
+ * GET /media/files/:id/thumbnail
+ * Public — serve a photo thumbnail (WebP, 400×400 cover crop).
+ * Returns 404 if no thumbnail exists yet; trigger POST /admin/generate-thumbnails to backfill.
+ */
+app.get("/media/files/:id/thumbnail", (req, res) => {
+  const thumbPath = findThumbPath(req.params.id);
+  if (!thumbPath) return res.status(404).json({ error: "Thumbnail not found" });
+  let stat;
+  try { stat = fs.statSync(thumbPath); } catch (_) {
+    return res.status(404).json({ error: "Thumbnail not found" });
+  }
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  res.setHeader("Content-Type", "image/webp");
+  res.setHeader("Content-Length", stat.size);
+  fs.createReadStream(thumbPath).pipe(res);
+});
+
+/**
  * POST /media/upload
  * Protected
  * Body: multipart/form-data, field "files" (one or many)
@@ -521,6 +584,9 @@ app.post("/media/upload", requireAuth, (req, res) => {
             .webp({ quality: WEBP_QUALITY })
             .toFile(outPath);
           fs.unlinkSync(file.path);
+          try {
+            await generatePhotoThumb(outPath, path.join(targetDrive, "thumbs", `${id}.webp`));
+          } catch (_) {}
           const meta = buildPhotoMeta(targetDrive, outName);
           results.push({
             ...meta, originalName: file.originalname,
@@ -528,7 +594,11 @@ app.post("/media/upload", requireAuth, (req, res) => {
           });
         } else {
           const outName = buildStoredName(id, sanitizeName(file.originalname));
-          await moveFile(file.path, path.join(targetDrive, "photos", outName));
+          const outPath = path.join(targetDrive, "photos", outName);
+          await moveFile(file.path, outPath);
+          try {
+            await generatePhotoThumb(outPath, path.join(targetDrive, "thumbs", `${id}.webp`));
+          } catch (_) {}
           results.push({
             ...buildPhotoMeta(targetDrive, outName),
             originalName: file.originalname, converted: false,
@@ -690,6 +760,24 @@ app.get("/media/videos/:id/stream/*", (req, res) => {
 });
 
 /**
+ * GET /media/videos/:id/thumbnail
+ * Public — serve a video thumbnail (WebP, frame extracted from first .ts segment).
+ * Returns 404 if no thumbnail exists yet; trigger POST /admin/generate-thumbnails to backfill.
+ */
+app.get("/media/videos/:id/thumbnail", (req, res) => {
+  const thumbPath = findThumbPath(req.params.id);
+  if (!thumbPath) return res.status(404).json({ error: "Thumbnail not found" });
+  let stat;
+  try { stat = fs.statSync(thumbPath); } catch (_) {
+    return res.status(404).json({ error: "Thumbnail not found" });
+  }
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  res.setHeader("Content-Type", "image/webp");
+  res.setHeader("Content-Length", stat.size);
+  fs.createReadStream(thumbPath).pipe(res);
+});
+
+/**
  * POST /media/videos/upload
  * Protected
  * Body: multipart/form-data
@@ -833,6 +921,66 @@ app.delete("/media/videos/:id", requireAuth, (req, res) => {
   }
 });
 
+// ─── ADMIN ───────────────────────────────────────────────────────────────────
+
+let thumbGenInProgress = false;
+
+/**
+ * POST /admin/generate-thumbnails
+ * Protected — scans all photos and videos and generates missing thumbnails.
+ * Skips any media that already has a thumbnail. Safe to run multiple times.
+ * Video thumbnails require ffmpeg to be installed on the Pi.
+ */
+app.post("/admin/generate-thumbnails", requireAuth, async (_req, res) => {
+  if (thumbGenInProgress) {
+    return res.status(409).json({ error: "Thumbnail generation already in progress." });
+  }
+  thumbGenInProgress = true;
+
+  try {
+    let photosDone = 0, photosSkipped = 0, photosFailed = 0;
+    let videosDone = 0, videosSkipped = 0, videosFailed = 0;
+
+    for (const dir of MEDIA_DIRS) {
+      // Photos
+      let photoEntries;
+      try { photoEntries = fs.readdirSync(path.join(dir, "photos")); } catch (_) { photoEntries = []; }
+      for (const filename of photoEntries) {
+        const parsed = parseStoredName(filename);
+        if (!parsed) continue;
+        const thumbPath = path.join(dir, "thumbs", `${parsed.id}.webp`);
+        if (fs.existsSync(thumbPath)) { photosSkipped++; continue; }
+        try {
+          await generatePhotoThumb(path.join(dir, "photos", filename), thumbPath);
+          photosDone++;
+        } catch (_) { photosFailed++; }
+      }
+
+      // Videos
+      let videoEntries;
+      try { videoEntries = fs.readdirSync(path.join(dir, "videos"), { withFileTypes: true }); } catch (_) { videoEntries = []; }
+      for (const entry of videoEntries) {
+        if (!entry.isDirectory()) continue;
+        const parsed = parseStoredName(entry.name);
+        if (!parsed) continue;
+        const thumbPath = path.join(dir, "thumbs", `${parsed.id}.webp`);
+        if (fs.existsSync(thumbPath)) { videosSkipped++; continue; }
+        const ok = await generateVideoThumb(path.join(dir, "videos", entry.name), thumbPath);
+        if (ok) videosDone++; else videosFailed++;
+      }
+    }
+
+    res.json({
+      photos: { generated: photosDone, skipped: photosSkipped, failed: photosFailed },
+      videos: { generated: videosDone, skipped: videosSkipped, failed: videosFailed },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Generation failed", detail: err.message });
+  } finally {
+    thumbGenInProgress = false;
+  }
+});
+
 // ─── DEDUPLICATION ──────────────────────────────────────────────────────────
 
 // Applies to photos only. Video deduplication at segment level is not meaningful —
@@ -939,7 +1087,8 @@ app.use((_req, res) => res.status(404).json({ error: "Route not found" }));
 app.listen(PORT, () => {
   console.log(`\n🚀 Media server running on port ${PORT}`);
   console.log(`🔒 Auth: JWT, expiry ${TOKEN_EXPIRY}`);
-  console.log(`🖼️  WebP quality: ${WEBP_QUALITY}\n`);
+  console.log(`🖼️  WebP quality: ${WEBP_QUALITY}`);
+  console.log(`🖼️  Thumb size: ${THUMB_SIZE}px  quality: ${THUMB_QUALITY}\n`);
   console.log(`Drives:`);
   for (const dir of MEDIA_DIRS) {
     const freeGB = (getDriveFreeBytes(dir) / 1024 / 1024 / 1024).toFixed(1);
@@ -953,6 +1102,7 @@ app.listen(PORT, () => {
   console.log(`  GET    /media/files?ids=a,b,c         → batch fetch photos 🔒`);
   console.log(`  GET    /media/files/:id               → photo metadata 🔒`);
   console.log(`  GET    /media/files/:id/stream        → serve photo (public)`);
+  console.log(`  GET    /media/files/:id/thumbnail     → serve photo thumbnail (public)`);
   console.log(`  POST   /media/upload                  → upload photos 🔒`);
   console.log(`  PATCH  /media/files/:id               → rename photo 🔒`);
   console.log(`  DELETE /media/files/:id               → delete photo 🔒`);
@@ -962,8 +1112,11 @@ app.listen(PORT, () => {
   console.log(`  GET    /media/videos?ids=a,b,c        → batch fetch videos 🔒`);
   console.log(`  GET    /media/videos/:id              → video metadata 🔒`);
   console.log(`  GET    /media/videos/:id/stream/*     → serve HLS file (public)`);
+  console.log(`  GET    /media/videos/:id/thumbnail    → serve video thumbnail (public)`);
   console.log(`  POST   /media/videos/upload           → upload video ZIP 🔒`);
   console.log(`  POST   /media/videos/:id/files        → add subtitle / audio track 🔒`);
   console.log(`  PATCH  /media/videos/:id              → rename video 🔒`);
-  console.log(`  DELETE /media/videos/:id              → delete video 🔒\n`);
+  console.log(`  DELETE /media/videos/:id              → delete video 🔒`);
+  console.log(`  ── Admin ──`);
+  console.log(`  POST   /admin/generate-thumbnails     → backfill all thumbnails 🔒\n`);
 });
